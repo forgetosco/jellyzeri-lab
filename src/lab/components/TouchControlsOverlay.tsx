@@ -46,26 +46,34 @@ function VirtualStick({ label, onChange, accentClass, testId }: VirtualStickProp
         aria-label={label}
         onPointerDown={(e) => {
           e.stopPropagation();
+          if (activePointerId.current !== null) return;
           activePointerId.current = e.pointerId;
-          e.currentTarget.setPointerCapture(e.pointerId);
+          try {
+            e.currentTarget.setPointerCapture(e.pointerId);
+          } catch {
+            // Ignore synthetic pointer events without active capture state
+          }
           updateFromClient(e.clientX, e.clientY);
         }}
         onPointerMove={(e) => {
           if (activePointerId.current !== e.pointerId) return;
+          e.stopPropagation();
           updateFromClient(e.clientX, e.clientY);
         }}
         onPointerUp={(e) => {
           if (activePointerId.current !== e.pointerId) return;
+          e.stopPropagation();
           resetStick();
         }}
         onPointerCancel={(e) => {
           if (activePointerId.current !== e.pointerId) return;
+          e.stopPropagation();
           resetStick();
         }}
-        className="relative w-24 h-24 rounded-full border border-slate-500/50 bg-slate-900/75 touch-none flex items-center justify-center cursor-grab active:cursor-grabbing"
+        className="relative w-24 h-24 rounded-full border border-slate-500/55 bg-slate-900/75 touch-none flex items-center justify-center cursor-grab active:cursor-grabbing"
       >
         <div
-          className={`w-10 h-10 rounded-full border border-white/30 ${accentClass}`}
+          className={`w-10 h-10 rounded-full border border-white/35 ${accentClass}`}
           style={{
             transform: `translate(${knob.x}px, ${knob.y}px)`,
           }}
@@ -78,68 +86,90 @@ function VirtualStick({ label, onChange, accentClass, testId }: VirtualStickProp
 
 interface TouchControlsOverlayProps {
   visible: boolean;
+  leftStickLabel: string;
   chargeLabel: string;
   chargeRatio: number;
+  isGrounded: boolean;
   onLeftStick: (x: number, y: number) => void;
-  onRightStick: (x: number, y: number) => void;
   onChargeChange: (charging: boolean) => void;
 }
 
 export function TouchControlsOverlay({
   visible,
+  leftStickLabel,
   chargeLabel,
   chargeRatio,
+  isGrounded,
   onLeftStick,
-  onRightStick,
   onChargeChange,
 }: TouchControlsOverlayProps) {
+  const chargePointerId = useRef<number | null>(null);
+
   if (!visible) return null;
 
   return (
     <div
-      className="pointer-events-none fixed inset-x-0 bottom-28 sm:bottom-24 z-20 flex items-end justify-between px-4 sm:px-8"
+      className="pointer-events-none fixed inset-x-0 bottom-20 sm:bottom-24 z-20 flex items-end justify-between px-4 sm:px-8"
       data-testid="touch-controls-overlay"
     >
       <div className="pointer-events-auto">
         <VirtualStick
-          label="Move / Aim"
+          label={leftStickLabel}
           onChange={onLeftStick}
-          accentClass="bg-purple-500/80"
+          accentClass="bg-purple-500/85"
           testId="virtual-left-stick"
         />
       </div>
 
-      <div className="pointer-events-auto flex items-end gap-4">
+      <div className="pointer-events-auto flex flex-col items-center gap-1.5">
         <button
           type="button"
           data-testid="touch-charge-button"
+          aria-label={chargeLabel}
+          aria-disabled={!isGrounded}
           onPointerDown={(e) => {
             e.stopPropagation();
-            e.currentTarget.setPointerCapture(e.pointerId);
+            if (chargePointerId.current !== null) return;
+            chargePointerId.current = e.pointerId;
+            try {
+              e.currentTarget.setPointerCapture(e.pointerId);
+            } catch {
+              // Ignore synthetic pointer events without active capture state
+            }
             onChargeChange(true);
           }}
-          onPointerUp={(e) => {
+          onPointerMove={(e) => {
+            if (chargePointerId.current !== e.pointerId) return;
             e.stopPropagation();
+          }}
+          onPointerUp={(e) => {
+            if (chargePointerId.current !== e.pointerId) return;
+            e.stopPropagation();
+            chargePointerId.current = null;
             onChargeChange(false);
           }}
-          onPointerCancel={() => onChargeChange(false)}
-          className="min-w-[84px] min-h-[56px] px-4 py-3 rounded-xl border border-cyan-400/50 bg-slate-900/85 text-cyan-300 font-semibold text-xs tracking-wider active:scale-95 transition-transform touch-none flex flex-col items-center justify-center gap-1"
+          onPointerCancel={(e) => {
+            if (chargePointerId.current !== e.pointerId) return;
+            e.stopPropagation();
+            chargePointerId.current = null;
+            onChargeChange(false);
+          }}
+          className={`min-w-[96px] min-h-[72px] px-4 py-3 rounded-2xl border font-semibold text-xs tracking-wider transition-transform touch-none flex flex-col items-center justify-center gap-1.5 ${
+            isGrounded
+              ? 'border-cyan-400/65 bg-slate-900/85 text-cyan-300 active:scale-95'
+              : 'border-slate-700/70 bg-slate-900/55 text-slate-500 opacity-75'
+          }`}
         >
           <span>{chargeLabel}</span>
-          <span className="w-14 h-1.5 rounded-full bg-slate-700 overflow-hidden">
+          <span className="w-16 h-1.5 rounded-full bg-slate-700 overflow-hidden">
             <span
-              className="block h-full bg-cyan-400 transition-[width] duration-75"
+              className={`block h-full transition-[width] duration-75 ${
+                isGrounded ? 'bg-cyan-400' : 'bg-slate-500'
+              }`}
               style={{ width: `${Math.round(chargeRatio * 100)}%` }}
             />
           </span>
         </button>
-
-        <VirtualStick
-          label="Camera"
-          onChange={onRightStick}
-          accentClass="bg-cyan-500/80"
-          testId="virtual-right-stick"
-        />
       </div>
     </div>
   );

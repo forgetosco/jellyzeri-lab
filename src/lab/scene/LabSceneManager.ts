@@ -2,11 +2,14 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import type { TestId } from '../i18n/translations';
 import {
-  computeBalloonBuoyancyForce,
+  computeAirborneVelocity,
   computeCameraRelativeDirection,
+  computeGroundedVelocity,
   computeImpulseVector,
   normalizeStickInput,
+  stepChargeState,
   stepSquashSpring,
+  type ChargeState,
   type SquashSpringState,
   type Vec3,
 } from '../math/cameraControls';
@@ -18,13 +21,13 @@ import {
 } from '../physics/PhysicsEngine';
 import {
   createArenaFloorTextures,
-  createBalloonBabyRig,
   createContactShadowTexture,
   createImpulseArrow,
-  createMotherBeacon,
   createPurpleSlimeRig,
-  type BalloonRig,
+  createRampChevronTexture,
+  updateSlimeVisuals,
   type ImpulseArrowRig,
+  type SlimeExpressionState,
   type SlimeRig,
 } from './JellyMeshes';
 import type { WebAudioSynth } from '../audio/WebAudioSynth';
@@ -41,10 +44,12 @@ export interface LabTelemetry {
   isSoftwareGl: boolean;
   cameraYawDeg: number;
   chargeRatio: number;
+  isGrounded: boolean;
+  supportNormalY: number;
+  slimePos: Vec3;
+  slimeVelY: number;
   impulseVec: Vec3;
   gamepadName: string | null;
-  balloonAltitude: number;
-  balloonInGoal: boolean;
   engineKind: PhysicsEngineKind;
   rapierReady: boolean;
 }
@@ -54,10 +59,41 @@ interface DynamicProp {
   type: 'box' | 'sphere';
 }
 
+interface PlatformBoxSpec {
+  id: string;
+  pos: [number, number, number];
+  size: [number, number, number];
+  color: string;
+  trimColor?: string;
+  restitution?: number;
+}
+
 const _dummyObj = new THREE.Object3D();
-const _tempVec = new THREE.Vector3();
 const _targetCamPos = new THREE.Vector3();
 const _targetLook = new THREE.Vector3();
+
+// Stage 1 arena layout (single source of truth for visuals + physics + shadow projection)
+const ARENA_PLATFORMS: PlatformBoxSpec[] = [
+  { id: 'plat-low', pos: [-4.8, 0.3, -1.5], size: [3.8, 0.6, 3.8], color: '#1e293b', trimColor: '#38bdf8' },
+  { id: 'plat-med', pos: [5.5, 0.7, -4.5], size: [4.6, 1.4, 4.6], color: '#273549', trimColor: '#22d3ee' },
+  { id: 'plat-high', pos: [0.0, 1.25, -9.2], size: [4.8, 2.5, 3.8], color: '#334155', trimColor: '#a855f7' },
+  // Vertical test walls (for validating lateral wall collision does NOT grant jump)
+  { id: 'wall-test-a', pos: [-2.6, 1.3, 1.8], size: [1.1, 2.6, 2.4], color: '#475569', trimColor: '#f59e0b', restitution: 0.2 },
+  { id: 'wall-test-b', pos: [2.4, 1.3, -6.5], size: [1.1, 2.6, 2.4], color: '#475569', trimColor: '#f59e0b', restitution: 0.2 },
+];
+
+// Inclined ramp connecting floor (y=0, z=1.8) up to plat-med front edge (y=1.4, z=-2.2)
+const RAMP_RISE = 1.4;
+const RAMP_RUN = 4.0;
+const RAMP_ANGLE = Math.atan2(RAMP_RISE, RAMP_RUN); // ~19.3 deg
+const RAMP_LENGTH = Math.hypot(RAMP_RUN, RAMP_RISE);
+const RAMP_THICKNESS = 0.24;
+const RAMP_WIDTH = 2.6;
+const RAMP_POS: [number, number, number] = [
+  5.5,
+  RAMP_RISE / 2 - (RAMP_THICKNESS / 2) * Math.cos(RAMP_ANGLE),
+  -0.2 - (RAMP_THICKNESS / 2) * Math.sin(RAMP_ANGLE),
+];
 
 function detectSoftwareWebGL(): { isSoftware: boolean; rendererLabel: string } {
   if (typeof document === 'undefined') {
@@ -89,51 +125,47 @@ export class LabSceneManager {
 
   private shadowTexture: THREE.CanvasTexture;
   private slimeRig: SlimeRig;
-  private balloonRig: BalloonRig | null = null;
-  private motherBeacon: THREE.Group | null = null;
   private impulseArrow: ImpulseArrowRig;
 
   private dynamicGroup = new THREE.Group();
   private stressBoxesMesh: THREE.InstancedMesh | null = null;
   private stressSpheresMesh: THREE.InstancedMesh | null = null;
   private stressProps: DynamicProp[] = [];
-  private bumperMeshes: THREE.Mesh[] = [];
 
   private physics: IPhysicsWorld | null = null;
   private slimeBody: PhysicsBodyHandle | null = null;
-  private balloonBody: PhysicsBodyHandle | null = null;
 
-  private activeTest: TestId = 'A';
-  private engineKind: PhysicsEngineKind = 'cannon';
+  private activeTest: TestId = 'ARENA';
+  private engineKind: PhysicsEngineKind = 'rapier';
   private stressCount = 24;
   private rapierReady = false;
   private rebuilding = false;
 
-  // Controls state
+  // Controls state (no Q/E camera keys; strict pointerId isolation for multitouch)
   private keys = new Set<string>();
   private leftStick = { x: 0, y: 0 };
-  private rightStick = { x: 0, y: 0 };
   private touchCharging = false;
   private keyCharging = false;
-  private isDraggingCamera = false;
+  private cameraPointerId: number | null = null;
   private lastPointerX = 0;
   private lastPointerY = 0;
 
   // Camera state
-  private cameraYaw = 0;
-  private cameraPitch = 0.42;
-  private cameraDistance = 8.5;
-  private smoothedCamPos = new THREE.Vector3(0, 4.5, 8.5);
-  private smoothedLookTarget = new THREE.Vector3(0, 0.8, 0);
+  private cameraYaw = 0.25;
+  private cameraPitch = 0.4;
+  private cameraDistance = 8.4;
+  private smoothedCamPos = new THREE.Vector3(2.0, 4.2, 11.4);
+  private smoothedLookTarget = new THREE.Vector3(0, 0.9, 4.0);
 
-  // Slime charge & squash state
-  private chargeRatio = 0;
-  private wasCharging = false;
-  private prevSlimeVelY = 0;
+  // Slime physics, charge & squash state
+  private chargeState: ChargeState = { isCharging: false, chargeRatio: 0 };
+  private isGrounded = true;
+  private supportNormalY = 1;
+  private wasGrounded = true;
+  private landingExprTimer = 0;
   private squashState: SquashSpringState = { scaleY: 1, velocityY: 0, scaleXZ: 1 };
   private wobbleEnergy = 0;
   private elapsed = 0;
-  private lastBalloonChimeTime = -10;
 
   // Loop & telemetry
   private frameId = 0;
@@ -165,7 +197,7 @@ export class LabSceneManager {
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.08;
     this.renderer.setPixelRatio(
-      this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2)
+      this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 1.5)
     );
     this.renderer.shadowMap.enabled = !this.isSoftwareGl;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -181,12 +213,11 @@ export class LabSceneManager {
 
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color('#0d1526');
-    this.scene.fog = new THREE.FogExp2('#0d1526', 0.018);
+    this.scene.fog = new THREE.FogExp2('#0d1526', 0.017);
 
     this.camera = new THREE.PerspectiveCamera(54, width / height, 0.1, 140);
     this.camera.position.copy(this.smoothedCamPos);
 
-    // Studio environment reflection (works on both GPU and software WebGL)
     const pmrem = new THREE.PMREMGenerator(this.renderer);
     this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
     pmrem.dispose();
@@ -211,14 +242,13 @@ export class LabSceneManager {
     this.resizeObserver = new ResizeObserver(() => this.handleResize());
     this.resizeObserver.observe(this.container);
 
-    // Initialize initial scene
     void this.rebuildScenario();
     this.lastFrameTs = performance.now();
     this.scheduleNextTick();
   }
 
   private setupLighting() {
-    const hemi = new THREE.HemisphereLight('#93c5fd', '#1e293b', 0.85);
+    const hemi = new THREE.HemisphereLight('#93c5fd', '#1e293b', 0.9);
     this.scene.add(hemi);
 
     const keyLight = new THREE.DirectionalLight('#fff4e6', 1.85);
@@ -235,7 +265,7 @@ export class LabSceneManager {
     keyLight.shadow.normalBias = 0.02;
     this.scene.add(keyLight);
 
-    const rimLight = new THREE.DirectionalLight('#38bdf8', 0.75);
+    const rimLight = new THREE.DirectionalLight('#c084fc', 0.8);
     rimLight.position.set(-12, 8, -10);
     this.scene.add(rimLight);
   }
@@ -244,70 +274,104 @@ export class LabSceneManager {
     const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
     const { map, bumpMap } = createArenaFloorTextures(maxAniso);
 
-    // Extended terrain base
-    const groundGeo = new THREE.BoxGeometry(36, 1, 36);
-    const groundMat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      map,
-      bumpMap,
-      bumpScale: 0.02,
-      roughness: 0.78,
-      metalness: 0.08,
-    });
-    const ground = new THREE.Mesh(groundGeo, groundMat);
+    // Arena ground slab (top surface at y = 0)
+    const ground = new THREE.Mesh(
+      new THREE.BoxGeometry(36, 1, 36),
+      new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        map,
+        bumpMap,
+        bumpScale: 0.02,
+        roughness: 0.78,
+        metalness: 0.08,
+      })
+    );
     ground.position.y = -0.5;
     ground.receiveShadow = true;
     this.scene.add(ground);
 
-    // Horizon skirt extending outward so scene never looks like a floating void box
+    // Horizon skirt
     const skirtGeo = new THREE.RingGeometry(18, 80, 48);
     skirtGeo.rotateX(-Math.PI / 2);
-    const skirtMat = new THREE.MeshStandardMaterial({
-      color: '#0f172a',
-      roughness: 0.92,
-      metalness: 0.05,
-    });
-    const skirt = new THREE.Mesh(skirtGeo, skirtMat);
+    const skirt = new THREE.Mesh(
+      skirtGeo,
+      new THREE.MeshStandardMaterial({
+        color: '#0f172a',
+        roughness: 0.92,
+        metalness: 0.05,
+      })
+    );
     skirt.position.y = -0.06;
     this.scene.add(skirt);
 
-    // Testing platforms (stepped heights for jumping & balloon delivery)
-    const platMatA = new THREE.MeshStandardMaterial({
-      color: '#1e293b',
-      roughness: 0.55,
-      metalness: 0.18,
-    });
-    const platMatB = new THREE.MeshStandardMaterial({
-      color: '#334155',
-      roughness: 0.42,
-      metalness: 0.25,
-    });
-
-    const platforms: { pos: [number, number, number]; size: [number, number, number]; mat: THREE.Material }[] = [
-      { pos: [-5.5, 0.45, -3.5], size: [4.2, 0.9, 4.2], mat: platMatA },
-      { pos: [6.0, 0.85, -4.5], size: [5.0, 1.7, 5.0], mat: platMatB },
-      { pos: [0.0, 0.35, -8.5], size: [5.4, 0.7, 3.6], mat: platMatA },
-    ];
-
-    platforms.forEach((p) => {
-      const mesh = new THREE.Mesh(new THREE.BoxGeometry(...p.size), p.mat);
+    // Stage 1 platforms & vertical test walls
+    ARENA_PLATFORMS.forEach((p) => {
+      const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(...p.size),
+        new THREE.MeshStandardMaterial({
+          color: p.color,
+          roughness: 0.5,
+          metalness: 0.18,
+        })
+      );
       mesh.position.set(...p.pos);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       this.scene.add(mesh);
 
-      // Clean trim rim positioned cleanly below platform top face (no coplanar Z-fighting)
-      const trim = new THREE.Mesh(
-        new THREE.BoxGeometry(p.size[0] + 0.06, 0.06, p.size[2] + 0.06),
-        new THREE.MeshStandardMaterial({ color: '#0ea5e9', roughness: 0.3, emissive: '#0369a1', emissiveIntensity: 0.35 })
-      );
-      trim.position.set(p.pos[0], p.pos[1] + p.size[1] / 2 - 0.055, p.pos[2]);
-      this.scene.add(trim);
+      if (p.trimColor) {
+        const trim = new THREE.Mesh(
+          new THREE.BoxGeometry(p.size[0] + 0.05, 0.06, p.size[2] + 0.05),
+          new THREE.MeshStandardMaterial({
+            color: p.trimColor,
+            emissive: p.trimColor,
+            emissiveIntensity: 0.3,
+            roughness: 0.3,
+          })
+        );
+        trim.position.set(p.pos[0], p.pos[1] + p.size[1] / 2 - 0.055, p.pos[2]);
+        this.scene.add(trim);
+      }
     });
 
-    // Natural perimeter pillars (distant landmarks for camera orientation)
+    // Inclined ramp with directional chevron texture
+    const rampTex = createRampChevronTexture(maxAniso);
+    const rampMesh = new THREE.Mesh(
+      new THREE.BoxGeometry(RAMP_WIDTH, RAMP_THICKNESS, RAMP_LENGTH),
+      new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        map: rampTex,
+        roughness: 0.55,
+        metalness: 0.14,
+      })
+    );
+    rampMesh.position.set(...RAMP_POS);
+    rampMesh.rotation.x = RAMP_ANGLE;
+    rampMesh.castShadow = true;
+    rampMesh.receiveShadow = true;
+    this.scene.add(rampMesh);
+
+    // Launch calibration pad ring at spawn (x=0, z=4.0)
+    const padGeo = new THREE.RingGeometry(1.05, 1.22, 32);
+    padGeo.rotateX(-Math.PI / 2);
+    const padMat = new THREE.MeshBasicMaterial({
+      color: '#a855f7',
+      transparent: true,
+      opacity: 0.4,
+      side: THREE.DoubleSide,
+    });
+    const pad = new THREE.Mesh(padGeo, padMat);
+    pad.position.set(0, 0.02, 4.0);
+    this.scene.add(pad);
+
+    // Natural perimeter orientation landmarks
     const pillarMat = new THREE.MeshStandardMaterial({ color: '#1e293b', roughness: 0.75 });
-    const capMat = new THREE.MeshStandardMaterial({ color: '#38bdf8', emissive: '#0284c7', emissiveIntensity: 0.5, roughness: 0.3 });
+    const capMat = new THREE.MeshStandardMaterial({
+      color: '#38bdf8',
+      emissive: '#0284c7',
+      emissiveIntensity: 0.5,
+      roughness: 0.3,
+    });
     for (let i = 0; i < 8; i++) {
       const angle = (i / 8) * Math.PI * 2;
       const dist = 16.5;
@@ -342,7 +406,7 @@ export class LabSceneManager {
   public async setStressCount(count: number) {
     if (this.stressCount === count) return;
     this.stressCount = count;
-    if (this.activeTest === 'E') {
+    if (this.activeTest === 'STRESS') {
       await this.rebuildScenario();
     }
   }
@@ -356,11 +420,6 @@ export class LabSceneManager {
     this.leftStick.y = y;
   }
 
-  public setTouchRightStick(x: number, y: number) {
-    this.rightStick.x = x;
-    this.rightStick.y = y;
-  }
-
   public setTouchCharge(charging: boolean) {
     if (charging && !this.touchCharging) {
       void this.audio.unlock();
@@ -369,14 +428,6 @@ export class LabSceneManager {
   }
 
   private clearDynamicScenario() {
-    if (this.balloonRig) {
-      this.dynamicGroup.remove(this.balloonRig.root);
-      this.balloonRig = null;
-    }
-    if (this.motherBeacon) {
-      this.dynamicGroup.remove(this.motherBeacon);
-      this.motherBeacon = null;
-    }
     if (this.stressBoxesMesh) {
       this.dynamicGroup.remove(this.stressBoxesMesh);
       this.stressBoxesMesh.geometry.dispose();
@@ -389,14 +440,7 @@ export class LabSceneManager {
       (this.stressSpheresMesh.material as THREE.Material).dispose();
       this.stressSpheresMesh = null;
     }
-    for (const m of this.bumperMeshes) {
-      this.dynamicGroup.remove(m);
-      m.geometry.dispose();
-      (m.material as THREE.Material).dispose();
-    }
-    this.bumperMeshes = [];
     this.stressProps = [];
-    this.balloonBody = null;
     this.slimeBody = null;
 
     if (this.physics) {
@@ -421,73 +465,62 @@ export class LabSceneManager {
       }
       this.physics = world;
 
-      // Static arena colliders matching visual platforms
-      world.addStaticBox('ground', { x: 0, y: -0.5, z: 0 }, { x: 18, y: 0.5, z: 18 }, 0.3);
-      world.addStaticBox('plat-left', { x: -5.5, y: 0.45, z: -3.5 }, { x: 2.1, y: 0.45, z: 2.1 }, 0.3);
-      world.addStaticBox('plat-right', { x: 6.0, y: 0.85, z: -4.5 }, { x: 2.5, y: 0.85, z: 2.5 }, 0.3);
-      world.addStaticBox('plat-back', { x: 0.0, y: 0.35, z: -8.5 }, { x: 2.7, y: 0.35, z: 1.8 }, 0.3);
+      // Ground collider
+      world.addStaticBox('ground', { x: 0, y: -0.5, z: 0 }, { x: 18, y: 0.5, z: 18 }, 0.08);
 
-      // Low perimeter curbs so objects stay in the arena
-      world.addStaticBox('wall-n', { x: 0, y: 0.6, z: -17.5 }, { x: 18, y: 0.8, z: 0.5 }, 0.5);
-      world.addStaticBox('wall-s', { x: 0, y: 0.6, z: 17.5 }, { x: 18, y: 0.8, z: 0.5 }, 0.5);
-      world.addStaticBox('wall-e', { x: 17.5, y: 0.6, z: 0 }, { x: 0.5, y: 0.8, z: 18 }, 0.5);
-      world.addStaticBox('wall-w', { x: -17.5, y: 0.6, z: 0 }, { x: 0.5, y: 0.8, z: 18 }, 0.5);
+      // Platforms & vertical walls
+      ARENA_PLATFORMS.forEach((p) => {
+        world.addStaticBox(
+          p.id,
+          { x: p.pos[0], y: p.pos[1], z: p.pos[2] },
+          { x: p.size[0] / 2, y: p.size[1] / 2, z: p.size[2] / 2 },
+          p.restitution ?? 0.08
+        );
+      });
 
-      // Protagonist purple slime (starts grounded on floor)
+      // Inclined ramp collider
+      world.addStaticBox(
+        'ramp-med',
+        { x: RAMP_POS[0], y: RAMP_POS[1], z: RAMP_POS[2] },
+        { x: RAMP_WIDTH / 2, y: RAMP_THICKNESS / 2, z: RAMP_LENGTH / 2 },
+        0.05,
+        { x: Math.sin(RAMP_ANGLE / 2), y: 0, z: 0, w: Math.cos(RAMP_ANGLE / 2) }
+      );
+
+      // Low perimeter curbs
+      world.addStaticBox('wall-n', { x: 0, y: 0.6, z: -17.5 }, { x: 18, y: 0.8, z: 0.5 }, 0.35);
+      world.addStaticBox('wall-s', { x: 0, y: 0.6, z: 17.5 }, { x: 18, y: 0.8, z: 0.5 }, 0.35);
+      world.addStaticBox('wall-e', { x: 17.5, y: 0.6, z: 0 }, { x: 0.5, y: 0.8, z: 18 }, 0.35);
+      world.addStaticBox('wall-w', { x: -17.5, y: 0.6, z: 0 }, { x: 0.5, y: 0.8, z: 18 }, 0.35);
+
+      // Protagonist purple slime (canSleep: false ensures contact manifolds stay active while resting)
       this.slimeBody = world.addDynamicSphere(
         'slime',
-        { x: 0, y: 0.65, z: 3.2 },
+        { x: 0, y: 0.65, z: 4.0 },
         0.65,
         1.2,
-        { restitution: 0.45, friction: 0.4, linearDamping: 0.25, angularDamping: 0.65 }
+        {
+          restitution: 0.1,
+          friction: 0.55,
+          linearDamping: 0.18,
+          angularDamping: 0.65,
+          canSleep: false,
+        }
       );
+
+      // Perform one settle step so initial contact manifold is populated immediately
+      world.step(1 / 60);
+      const initSupport = world.getSupportContact(this.slimeBody);
+      this.isGrounded = initSupport.grounded;
+      this.wasGrounded = initSupport.grounded;
+      this.supportNormalY = initSupport.normalY;
+
+      this.chargeState = { isCharging: false, chargeRatio: 0 };
       this.squashState = { scaleY: 1, velocityY: 0, scaleXZ: 1 };
-      this.chargeRatio = 0;
-      this.wobbleEnergy = 0.25;
-      this.prevSlimeVelY = 0;
+      this.wobbleEnergy = 0.2;
+      this.landingExprTimer = 0;
 
-      // Test-specific objects
-      if (this.activeTest === 'B') {
-        // Elastic bumper blocks to test collision squash & bounce
-        const bumperPositions: [number, number, number][] = [
-          [-2.2, 0.7, -0.8],
-          [2.2, 0.7, -0.8],
-          [0, 0.7, -3.6],
-        ];
-        const bGeo = new THREE.BoxGeometry(1.4, 1.4, 1.4);
-        const bMat = new THREE.MeshStandardMaterial({
-          color: '#f59e0b',
-          roughness: 0.25,
-          metalness: 0.15,
-        });
-        bumperPositions.forEach((p, idx) => {
-          world.addStaticBox(`bumper-${idx}`, { x: p[0], y: p[1], z: p[2] }, { x: 0.7, y: 0.7, z: 0.7 }, 0.85);
-          const m = new THREE.Mesh(bGeo, bMat);
-          m.position.set(...p);
-          m.castShadow = true;
-          m.receiveShadow = true;
-          this.dynamicGroup.add(m);
-          this.bumperMeshes.push(m);
-        });
-      }
-
-      if (this.activeTest === 'C') {
-        this.balloonRig = createBalloonBabyRig(0.52, this.shadowTexture);
-        this.dynamicGroup.add(this.balloonRig.root);
-        this.balloonBody = world.addDynamicSphere(
-          'balloon-baby',
-          { x: 0, y: 1.6, z: -0.5 },
-          0.52,
-          0.55,
-          { restitution: 0.62, friction: 0.2, linearDamping: 0.65, angularDamping: 0.8 }
-        );
-
-        this.motherBeacon = createMotherBeacon();
-        this.motherBeacon.position.set(6.0, 1.7, -4.5);
-        this.dynamicGroup.add(this.motherBeacon);
-      }
-
-      if (this.activeTest === 'E') {
+      if (this.activeTest === 'STRESS') {
         const boxCount = Math.ceil(this.stressCount / 2);
         const sphereCount = Math.floor(this.stressCount / 2);
 
@@ -524,8 +557,8 @@ export class LabSceneManager {
           const r = 3.2 + (i % 4) * 1.4;
           const pos = {
             x: Math.cos(angle) * r,
-            y: 1.5 + (i % 5) * 0.9,
-            z: Math.sin(angle) * r - 1.5,
+            y: 2.2 + (i % 5) * 0.9,
+            z: Math.sin(angle) * r - 2.0,
           };
           const handle = world.addDynamicBox(
             `stress-box-${i}`,
@@ -546,8 +579,8 @@ export class LabSceneManager {
           const r = 2.6 + (i % 3) * 1.5;
           const pos = {
             x: Math.cos(angle) * r,
-            y: 2.0 + (i % 4) * 0.85,
-            z: Math.sin(angle) * r - 1.5,
+            y: 2.6 + (i % 4) * 0.85,
+            z: Math.sin(angle) * r - 2.0,
           };
           const handle = world.addDynamicSphere(
             `stress-sph-${i}`,
@@ -566,10 +599,11 @@ export class LabSceneManager {
         this.dynamicGroup.add(this.stressBoxesMesh, this.stressSpheresMesh);
       }
 
-      // Snap camera smoothly at slight 3/4 angle so slime face & depth read cleanly
-      this.cameraYaw = 0.28;
-      this.smoothedLookTarget.set(0, 0.8, 3.2);
-      this.smoothedCamPos.set(2.2, 4.3, 10.9);
+      // Snap camera smoothly behind slime at slight 3/4 angle; greet player with expressive face until movement starts
+      this.cameraYaw = 0.25;
+      this.slimeRig.visualGroup.rotation.y = 2.68;
+      this.smoothedLookTarget.set(0, 1.1, 4.0);
+      this.smoothedCamPos.set(1.9, 4.2, 11.5);
     } finally {
       this.rebuilding = false;
     }
@@ -579,9 +613,10 @@ export class LabSceneManager {
     window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('keyup', this.onKeyUp);
     const canvas = this.renderer.domElement;
-    canvas.addEventListener('pointerdown', this.onPointerDown);
-    window.addEventListener('pointermove', this.onPointerMove);
-    window.addEventListener('pointerup', this.onPointerUp);
+    canvas.addEventListener('pointerdown', this.onCanvasPointerDown);
+    window.addEventListener('pointermove', this.onWindowPointerMove);
+    window.addEventListener('pointerup', this.onWindowPointerUp);
+    window.addEventListener('pointercancel', this.onWindowPointerUp);
     canvas.addEventListener('wheel', this.onWheel, { passive: true });
   }
 
@@ -604,14 +639,20 @@ export class LabSceneManager {
     }
   };
 
-  private onPointerDown = (e: PointerEvent) => {
-    this.isDraggingCamera = true;
+  private onCanvasPointerDown = (e: PointerEvent) => {
+    if (this.cameraPointerId !== null) return;
+    this.cameraPointerId = e.pointerId;
     this.lastPointerX = e.clientX;
     this.lastPointerY = e.clientY;
+    try {
+      this.renderer.domElement.setPointerCapture(e.pointerId);
+    } catch {
+      // Ignore synthetic pointer events
+    }
   };
 
-  private onPointerMove = (e: PointerEvent) => {
-    if (!this.isDraggingCamera) return;
+  private onWindowPointerMove = (e: PointerEvent) => {
+    if (this.cameraPointerId === null || e.pointerId !== this.cameraPointerId) return;
     const dx = e.clientX - this.lastPointerX;
     const dy = e.clientY - this.lastPointerY;
     this.lastPointerX = e.clientX;
@@ -620,8 +661,9 @@ export class LabSceneManager {
     this.cameraPitch = THREE.MathUtils.clamp(this.cameraPitch + dy * 0.005, 0.16, 1.15);
   };
 
-  private onPointerUp = () => {
-    this.isDraggingCamera = false;
+  private onWindowPointerUp = (e: PointerEvent) => {
+    if (this.cameraPointerId === null || e.pointerId !== this.cameraPointerId) return;
+    this.cameraPointerId = null;
   };
 
   private onWheel = (e: WheelEvent) => {
@@ -652,10 +694,6 @@ export class LabSceneManager {
     if (this.keys.has('KeyW') || this.keys.has('ArrowUp')) ky += 1;
     if (this.keys.has('KeyS') || this.keys.has('ArrowDown')) ky -= 1;
 
-    let camX = 0;
-    if (this.keys.has('KeyQ')) camX -= 1;
-    if (this.keys.has('KeyE')) camX += 1;
-
     let gpName: string | null = null;
     let gpCharging = false;
     let gpMoveX = 0;
@@ -683,17 +721,42 @@ export class LabSceneManager {
 
     const combinedMoveX = THREE.MathUtils.clamp(kx + this.leftStick.x + gpMoveX, -1, 1);
     const combinedMoveY = THREE.MathUtils.clamp(ky + this.leftStick.y + gpMoveY, -1, 1);
-    const combinedCamX = THREE.MathUtils.clamp(camX + this.rightStick.x + gpCamX, -1, 1);
-    const combinedCamY = THREE.MathUtils.clamp(this.rightStick.y + gpCamY, -1, 1);
 
     return {
       moveX: combinedMoveX,
       moveY: combinedMoveY,
-      camX: combinedCamX,
-      camY: combinedCamY,
+      camX: THREE.MathUtils.clamp(gpCamX, -1, 1),
+      camY: THREE.MathUtils.clamp(gpCamY, -1, 1),
       charging: this.keyCharging || this.touchCharging || gpCharging,
       gamepadName: gpName,
     };
+  }
+
+  /**
+   * Computes highest supporting surface Y directly beneath (x, z) below slimeY
+   * for crisp contact shadow grounding across platforms and floor.
+   */
+  private sampleSurfaceHeightBelow(x: number, slimeY: number, z: number): number {
+    let highest = 0;
+    for (let i = 0; i < ARENA_PLATFORMS.length; i++) {
+      const p = ARENA_PLATFORMS[i];
+      const topY = p.pos[1] + p.size[1] / 2;
+      if (topY > slimeY + 0.05) continue;
+      const hx = p.size[0] / 2;
+      const hz = p.size[2] / 2;
+      if (Math.abs(x - p.pos[0]) <= hx && Math.abs(z - p.pos[2]) <= hz) {
+        if (topY > highest) highest = topY;
+      }
+    }
+    // Check inclined ramp footprint (x in [5.5 - 1.3, 5.5 + 1.3], z in [-2.2, 1.8])
+    if (Math.abs(x - RAMP_POS[0]) <= RAMP_WIDTH / 2 && z >= -2.2 && z <= 1.8) {
+      const t = (1.8 - z) / RAMP_RUN;
+      const rampY = t * RAMP_RISE;
+      if (rampY <= slimeY + 0.1 && rampY > highest) {
+        highest = rampY;
+      }
+    }
+    return highest;
   }
 
   private tick = () => {
@@ -707,105 +770,96 @@ export class LabSceneManager {
 
     const input = this.readCombinedInput();
 
-    // Independent camera rotation
+    // Independent camera rotation (Gamepad right stick + pointer drag)
     this.cameraYaw -= input.camX * dt * 2.3;
     this.cameraPitch = THREE.MathUtils.clamp(this.cameraPitch - input.camY * dt * 1.4, 0.16, 1.15);
 
     const worldDir = computeCameraRelativeDirection(input.moveX, input.moveY, this.cameraYaw);
-    const impulsePreview = computeImpulseVector(
-      input.moveX,
-      input.moveY,
-      this.cameraYaw,
-      Math.max(0.25, this.chargeRatio)
-    );
+    const moveMag = Math.hypot(worldDir.x, worldDir.z);
 
     if (this.physics && this.slimeBody) {
-      const slimeTf = this.slimeBody.getTransform();
+      const preTf = this.slimeBody.getTransform();
+      const preSupport = this.physics.getSupportContact(this.slimeBody);
+      this.isGrounded = preSupport.grounded;
+      this.supportNormalY = preSupport.normalY;
 
-      // Ground movement force/velocity blending
-      const moveSpeed = input.charging ? 3.2 : 6.4;
-      const moveMag = Math.hypot(worldDir.x, worldDir.z);
-      if (moveMag > 0.05) {
-        const curVel = this.slimeBody.getVelocity();
-        const blend = 1 - Math.exp(-8 * dt);
-        this.slimeBody.setVelocity({
-          x: THREE.MathUtils.lerp(curVel.x, worldDir.x * moveSpeed, blend),
-          y: curVel.y,
-          z: THREE.MathUtils.lerp(curVel.z, worldDir.z * moveSpeed, blend),
-        });
+      // Grounded vs airborne velocity handling (preserves ballistic trajectory in air)
+      const curVel = this.slimeBody.getVelocity();
+      if (this.isGrounded) {
+        const groundMaxSpeed = this.chargeState.isCharging ? 2.4 : 6.4;
+        const nextVel = computeGroundedVelocity(curVel, worldDir, groundMaxSpeed, 9.5, dt);
+        this.slimeBody.setVelocity(nextVel);
+      } else {
+        const nextVel = computeAirborneVelocity(curVel, worldDir, 5.4, 6.2, dt);
+        if (nextVel !== curVel) {
+          this.slimeBody.setVelocity(nextVel);
+        }
       }
 
-      // Charge & impulse launch
-      if (input.charging) {
-        this.chargeRatio = Math.min(1, this.chargeRatio + dt * 1.15);
-        this.audio.playChargeTick(this.chargeRatio);
-      } else if (this.wasCharging) {
-        const launch = computeImpulseVector(input.moveX, input.moveY, this.cameraYaw, this.chargeRatio);
+      // Strict grounded-only charge & single impulse launch
+      const chargeRes = stepChargeState(this.chargeState, input.charging, this.isGrounded, dt, 0.95);
+      this.chargeState = chargeRes.nextState;
+
+      if (this.chargeState.isCharging) {
+        this.audio.playChargeTick(this.chargeState.chargeRatio);
+      } else if (chargeRes.shouldLaunch) {
+        const launch = computeImpulseVector(
+          input.moveX,
+          input.moveY,
+          this.cameraYaw,
+          chargeRes.launchRatio
+        );
         this.slimeBody.applyImpulse(launch);
         this.squashState.scaleY = 1.42;
-        this.squashState.velocityY = 2.4;
+        this.squashState.velocityY = 2.6;
         this.wobbleEnergy = 1.0;
-        this.audio.playLaunch(this.chargeRatio);
-        this.chargeRatio = 0;
-      }
-      this.wasCharging = input.charging;
-
-      // Balloon baby weakened buoyancy + gentle air drag
-      if (this.balloonBody) {
-        const bTf = this.balloonBody.getTransform();
-        const lift = computeBalloonBuoyancyForce(
-          bTf.position.y,
-          2.6,
-          0.55,
-          this.physics.gravity,
-          this.elapsed
-        );
-        this.balloonBody.applyForce({ x: 0, y: lift, z: 0 });
-
-        // Detect playful slime-balloon bump for tactile audio feedback
-        const dist = Math.hypot(
-          slimeTf.position.x - bTf.position.x,
-          slimeTf.position.y - bTf.position.y,
-          slimeTf.position.z - bTf.position.z
-        );
-        if (dist < 1.25 && this.elapsed - this.lastBalloonChimeTime > 0.6) {
-          this.lastBalloonChimeTime = this.elapsed;
-          this.audio.playBalloonChime();
-          this.wobbleEnergy = Math.max(this.wobbleEnergy, 0.7);
-        }
+        this.audio.playLaunch(chargeRes.launchRatio);
+        this.isGrounded = false;
+        this.wasGrounded = false;
       }
 
       this.physics.step(dt);
 
-      // Post-step slime transform & landing impact detection
       const nextSlime = this.slimeBody.getTransform();
-      const velDeltaY = nextSlime.velocity.y - this.prevSlimeVelY;
-      if (velDeltaY > 3.2 && nextSlime.position.y < 3.5) {
-        const impact = Math.min(1, velDeltaY / 10);
-        this.squashState.scaleY = Math.max(0.55, 1 - impact * 0.42);
-        this.squashState.velocityY = -impact * 4.5;
-        this.wobbleEnergy = Math.min(1.2, this.wobbleEnergy + impact * 0.9);
+      const postSupport = this.physics.getSupportContact(this.slimeBody);
+      this.isGrounded = postSupport.grounded;
+      this.supportNormalY = postSupport.normalY;
+
+      // Landing detection from real air-to-ground contact transition
+      if (!this.wasGrounded && postSupport.grounded && preTf.velocity.y < -2.2) {
+        const impact = Math.min(1, Math.abs(preTf.velocity.y) / 11);
+        this.squashState.scaleY = Math.max(0.54, 1 - impact * 0.44);
+        this.squashState.velocityY = -impact * 4.8;
+        this.wobbleEnergy = Math.min(1.2, this.wobbleEnergy + impact * 0.95);
+        this.landingExprTimer = 0.2;
         this.audio.playBounce(impact);
       }
-      this.prevSlimeVelY = nextSlime.velocity.y;
+      this.wasGrounded = postSupport.grounded;
 
-      // If slime fell outside bounds (safety recovery)
-      if (nextSlime.position.y < -4) {
-        this.slimeBody.setPosition({ x: 0, y: 1.5, z: 3.2 });
+      if (this.landingExprTimer > 0) {
+        this.landingExprTimer = Math.max(0, this.landingExprTimer - dt);
       }
 
-      // Squash-stretch spring (decoupled from collider!)
-      const targetScaleY = input.charging ? 1 - this.chargeRatio * 0.45 : 1.0;
+      // Safety recovery if slime escapes arena
+      if (nextSlime.position.y < -4) {
+        this.slimeBody.setPosition({ x: 0, y: 1.5, z: 4.0 });
+      }
+
+      // Decoupled visual squash-stretch spring
+      const targetScaleY = this.chargeState.isCharging
+        ? 1 - this.chargeState.chargeRatio * 0.45
+        : !this.isGrounded && nextSlime.velocity.y > 1.5
+          ? 1.12
+          : 1.0;
       this.squashState = stepSquashSpring(this.squashState, targetScaleY, 240, 14, dt);
       this.wobbleEnergy = Math.max(0, this.wobbleEnergy - dt * 1.35);
 
+      const r = this.slimeRig.radius;
       this.slimeRig.root.position.set(
         nextSlime.position.x,
         nextSlime.position.y,
         nextSlime.position.z
       );
-      // Anchor visual squash at bottom of sphere so it presses into the floor instead of floating
-      const r = this.slimeRig.radius;
       this.slimeRig.visualGroup.scale.set(
         this.squashState.scaleXZ,
         this.squashState.scaleY,
@@ -819,20 +873,41 @@ export class LabSceneManager {
         let diff = targetFaceYaw - curY;
         while (diff > Math.PI) diff -= Math.PI * 2;
         while (diff < -Math.PI) diff += Math.PI * 2;
-        this.slimeRig.visualGroup.rotation.y += diff * (1 - Math.exp(-10 * dt));
+        this.slimeRig.visualGroup.rotation.y += diff * (1 - Math.exp(-11 * dt));
       }
 
-      // Contact shadow tracks beneath slime
-      this.slimeRig.contactShadow.position.y = -nextSlime.position.y + 0.025;
-      const shadowScale = Math.max(0.45, 1 - Math.max(0, nextSlime.position.y - r) * 0.12);
+      // Dynamic expression state
+      const expr: SlimeExpressionState =
+        this.landingExprTimer > 0
+          ? 'landing'
+          : !this.isGrounded
+            ? 'airborne'
+            : this.chargeState.isCharging
+              ? 'charging'
+              : moveMag > 0.08
+                ? 'moving'
+                : 'idle';
+      updateSlimeVisuals(this.slimeRig, expr, this.chargeState.chargeRatio, this.elapsed, dt);
+
+      // Contact shadow tracks supporting surface beneath slime
+      const surfY = this.sampleSurfaceHeightBelow(nextSlime.position.x, nextSlime.position.y, nextSlime.position.z);
+      const heightAboveSurf = Math.max(0, nextSlime.position.y - r - surfY);
+      this.slimeRig.contactShadow.position.y = surfY - nextSlime.position.y + 0.025;
+      const shadowScale = Math.max(0.45, 1 - heightAboveSurf * 0.13);
       this.slimeRig.contactShadow.scale.setScalar(shadowScale);
 
       this.slimeRig.shaderUniforms.uTime.value = this.elapsed;
       this.slimeRig.shaderUniforms.uWobble.value = this.wobbleEnergy;
-      this.slimeRig.shaderUniforms.uCharge.value = this.chargeRatio;
+      this.slimeRig.shaderUniforms.uCharge.value = this.chargeState.chargeRatio;
 
-      // Update 3D impulse direction arrow (always extends past slime radius)
-      const showArrow = this.activeTest === 'B' || this.activeTest === 'C' || this.activeTest === 'D';
+      // 3D launch direction arrow (shown when grounded and charging or aiming)
+      const impulsePreview = computeImpulseVector(
+        input.moveX,
+        input.moveY,
+        this.cameraYaw,
+        Math.max(0.25, this.chargeState.chargeRatio)
+      );
+      const showArrow = this.isGrounded && (this.chargeState.isCharging || moveMag > 0.15);
       this.impulseArrow.group.visible = showArrow;
       if (showArrow) {
         this.impulseArrow.group.position.set(
@@ -846,22 +921,11 @@ export class LabSceneManager {
         const shaftLen = Math.max(1.35, horizLen);
         this.impulseArrow.shaft.scale.set(1, 1, shaftLen);
         this.impulseArrow.head.position.set(0, 0, shaftLen + 0.16);
-        this.impulseArrow.ring.scale.setScalar(1 + this.chargeRatio * 0.35);
+        this.impulseArrow.ring.scale.setScalar(1 + this.chargeState.chargeRatio * 0.35);
       }
 
-      // Update Balloon Baby visual
-      if (this.balloonRig && this.balloonBody) {
-        const bTf = this.balloonBody.getTransform();
-        this.balloonRig.root.position.set(bTf.position.x, bTf.position.y, bTf.position.z);
-        this.balloonRig.visualGroup.rotation.y = Math.sin(this.elapsed * 0.8) * 0.25;
-        this.balloonRig.contactShadow.position.y = -bTf.position.y + 0.025;
-        if (bTf.position.y < -4) {
-          this.balloonBody.setPosition({ x: 0, y: 2.0, z: -0.5 });
-        }
-      }
-
-      // Update Stress InstancedMeshes (Test E)
-      if (this.activeTest === 'E' && this.stressBoxesMesh && this.stressSpheresMesh) {
+      // Stress instanced meshes
+      if (this.activeTest === 'STRESS' && this.stressBoxesMesh && this.stressSpheresMesh) {
         let boxIdx = 0;
         let sphIdx = 0;
         for (let i = 0; i < this.stressProps.length; i++) {
@@ -886,7 +950,7 @@ export class LabSceneManager {
         this.stressSpheresMesh.instanceMatrix.needsUpdate = true;
       }
 
-      // Third-person camera follow with exponential damping
+      // Smooth third-person camera follow
       _targetLook.set(
         nextSlime.position.x,
         nextSlime.position.y + 0.55,
@@ -907,17 +971,15 @@ export class LabSceneManager {
       this.camera.lookAt(this.smoothedLookTarget);
     }
 
-    const renderStart = performance.now();
     this.renderer.render(this.scene, this.camera);
-    const frameTime = performance.now() - renderStart + dt * 1000;
-    this.currentFrameMs = this.currentFrameMs * 0.85 + (dt * 1000) * 0.15;
+    this.currentFrameMs = this.currentFrameMs * 0.85 + dt * 1000 * 0.15;
     if (rawDt > 0 && rawDt < 0.8) {
       this.fpsSamples.push(1 / rawDt);
       if (this.fpsSamples.length > 20) this.fpsSamples.shift();
     }
 
     // Throttle React telemetry callback to <= 6 Hz
-    if (now - this.lastTelemetryTs > 170) {
+    if (now - this.lastTelemetryTs > 165) {
       this.lastTelemetryTs = now;
       const avgFps =
         this.fpsSamples.length > 0
@@ -925,17 +987,16 @@ export class LabSceneManager {
           : 0;
       const perfMem = (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory;
       const heapMb = perfMem ? perfMem.usedJSHeapSize / (1024 * 1024) : null;
-
-      let balloonAlt = 0;
-      let balloonInGoal = false;
-      if (this.balloonBody) {
-        const bp = this.balloonBody.getTransform().position;
-        balloonAlt = bp.y;
-        const distToGoal = Math.hypot(bp.x - 6.0, bp.y - 3.9, bp.z - -4.5);
-        balloonInGoal = distToGoal < 1.9;
-      }
-
+      const slimeTf = this.slimeBody?.getTransform();
       const deg = (((this.cameraYaw * 180) / Math.PI) % 360 + 360) % 360;
+
+      const impulsePreview = computeImpulseVector(
+        input.moveX,
+        input.moveY,
+        this.cameraYaw,
+        Math.max(0.25, this.chargeState.chargeRatio)
+      );
+
       this.onTelemetry({
         fps: Math.round(avgFps),
         frameMs: Number(this.currentFrameMs.toFixed(1)),
@@ -947,15 +1008,22 @@ export class LabSceneManager {
         rendererName: this.rendererLabel,
         isSoftwareGl: this.isSoftwareGl,
         cameraYawDeg: Math.round(deg),
-        chargeRatio: Number(this.chargeRatio.toFixed(2)),
+        chargeRatio: Number(this.chargeState.chargeRatio.toFixed(2)),
+        isGrounded: this.isGrounded,
+        supportNormalY: Number(this.supportNormalY.toFixed(2)),
+        slimePos: slimeTf
+          ? {
+              x: Number(slimeTf.position.x.toFixed(2)),
+              y: Number(slimeTf.position.y.toFixed(2)),
+              z: Number(slimeTf.position.z.toFixed(2)),
+            }
+          : { x: 0, y: 0.65, z: 4.0 },
+        slimeVelY: slimeTf ? Number(slimeTf.velocity.y.toFixed(2)) : 0,
         impulseVec: impulsePreview,
         gamepadName: input.gamepadName,
-        balloonAltitude: Number(balloonAlt.toFixed(2)),
-        balloonInGoal,
         engineKind: this.engineKind,
         rapierReady: this.rapierReady,
       });
-      void frameTime;
     }
 
     this.scheduleNextTick();
@@ -1001,9 +1069,10 @@ export class LabSceneManager {
     this.resizeObserver.disconnect();
     window.removeEventListener('keydown', this.onKeyDown);
     window.removeEventListener('keyup', this.onKeyUp);
-    this.renderer.domElement.removeEventListener('pointerdown', this.onPointerDown);
-    window.removeEventListener('pointermove', this.onPointerMove);
-    window.removeEventListener('pointerup', this.onPointerUp);
+    this.renderer.domElement.removeEventListener('pointerdown', this.onCanvasPointerDown);
+    window.removeEventListener('pointermove', this.onWindowPointerMove);
+    window.removeEventListener('pointerup', this.onWindowPointerUp);
+    window.removeEventListener('pointercancel', this.onWindowPointerUp);
     this.renderer.domElement.removeEventListener('wheel', this.onWheel);
 
     this.clearDynamicScenario();
@@ -1025,6 +1094,5 @@ export class LabSceneManager {
     if (this.renderer.domElement.parentElement === this.container) {
       this.container.removeChild(this.renderer.domElement);
     }
-    void _tempVec;
   }
 }

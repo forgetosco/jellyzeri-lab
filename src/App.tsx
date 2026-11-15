@@ -19,23 +19,31 @@ const INITIAL_TELEMETRY: LabTelemetry = {
   heapMb: null,
   rendererName: 'WebGL2',
   isSoftwareGl: false,
-  cameraYawDeg: 0,
+  cameraYawDeg: 14,
   chargeRatio: 0,
+  isGrounded: true,
+  supportNormalY: 1,
+  slimePos: { x: 0, y: 0.65, z: 4.0 },
+  slimeVelY: 0,
   impulseVec: { x: 0, y: 0, z: 0 },
   gamepadName: null,
-  balloonAltitude: 0,
-  balloonInGoal: false,
-  engineKind: 'cannon',
+  engineKind: 'rapier',
   rapierReady: false,
 };
 
 export default function App() {
   const [locale, setLocale] = useState<Locale>('pt-BR');
-  const [activeTab, setActiveTab] = useState<LabTab>('A');
-  const [engineKind, setEngineKind] = useState<PhysicsEngineKind>('cannon');
+  const [activeTab, setActiveTab] = useState<LabTab>('ARENA');
+  const [engineKind, setEngineKind] = useState<PhysicsEngineKind>('rapier');
   const [stressCount, setStressCount] = useState<number>(24);
-  const [touchVisible, setTouchVisible] = useState<boolean>(false);
-  const [dockOpen, setDockOpen] = useState<boolean>(true);
+  const [touchVisible, setTouchVisible] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth < 768 : false
+  );
+  const [dockOpen, setDockOpen] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth >= 640 : true
+  );
+  const userToggledTouchRef = useRef(false);
+  const userToggledDockRef = useRef(false);
   const [audioUnlocked, setAudioUnlocked] = useState<boolean>(false);
   const [musicPlaying, setMusicPlaying] = useState<boolean>(false);
   const [sfxVol, setSfxVol] = useState<number>(0.7);
@@ -57,7 +65,19 @@ export default function App() {
     });
     sceneMgrRef.current = mgr;
 
+    const onResize = () => {
+      const mobile = window.innerWidth < 768;
+      if (!userToggledTouchRef.current) {
+        setTouchVisible(mobile || window.matchMedia?.('(pointer: coarse)').matches === true);
+      }
+      if (!userToggledDockRef.current) {
+        setDockOpen(window.innerWidth >= 640);
+      }
+    };
+    window.addEventListener('resize', onResize);
+
     return () => {
+      window.removeEventListener('resize', onResize);
       mgr.dispose();
       audio.dispose();
       sceneMgrRef.current = null;
@@ -69,9 +89,6 @@ export default function App() {
     setActiveTab(tab);
     if (tab !== 'REPORT') {
       void sceneMgrRef.current?.setActiveTest(tab);
-      if (tab === 'D') {
-        setTouchVisible(true);
-      }
     }
   };
 
@@ -85,11 +102,23 @@ export default function App() {
     void sceneMgrRef.current?.setStressCount(count);
   };
 
+  const handleToggleTouch = () => {
+    userToggledTouchRef.current = true;
+    setTouchVisible((prev) => {
+      const next = !prev;
+      if (next && typeof window !== 'undefined' && window.innerWidth < 640) {
+        userToggledDockRef.current = true;
+        setDockOpen(false);
+      }
+      return next;
+    });
+  };
+
   const handleUnlockAudio = async () => {
     const ok = await audioRef.current?.unlock();
     setAudioUnlocked(Boolean(ok));
     if (ok) {
-      audioRef.current?.playBalloonChime();
+      audioRef.current?.playLaunch(0.4);
     }
   };
 
@@ -98,7 +127,7 @@ export default function App() {
     setAudioUnlocked(Boolean(ok));
     if (ok) {
       audioRef.current?.playLaunch(0.8);
-      window.setTimeout(() => audioRef.current?.playBalloonChime(), 160);
+      window.setTimeout(() => audioRef.current?.playBounce(0.6), 180);
     }
   };
 
@@ -110,29 +139,19 @@ export default function App() {
   };
 
   const tabs: { id: LabTab; label: string }[] = [
-    { id: 'A', label: t(locale, 'tabA') },
-    { id: 'B', label: t(locale, 'tabB') },
-    { id: 'C', label: t(locale, 'tabC') },
-    { id: 'D', label: t(locale, 'tabD') },
-    { id: 'E', label: t(locale, 'tabE') },
+    { id: 'ARENA', label: t(locale, 'tabArena') },
+    { id: 'STRESS', label: t(locale, 'tabStress') },
     { id: 'REPORT', label: t(locale, 'tabReport') },
   ];
 
   const activeInfo = (() => {
-    switch (activeTab) {
-      case 'A':
-        return { title: t(locale, 'testATitle'), desc: t(locale, 'testADesc'), hint: t(locale, 'moveHint') };
-      case 'B':
-        return { title: t(locale, 'testBTitle'), desc: t(locale, 'testBDesc'), hint: t(locale, 'chargeHint') };
-      case 'C':
-        return { title: t(locale, 'testCTitle'), desc: t(locale, 'testCDesc'), hint: t(locale, 'balloonHint') };
-      case 'D':
-        return { title: t(locale, 'testDTitle'), desc: t(locale, 'testDDesc'), hint: t(locale, 'cameraHint') };
-      case 'E':
-        return { title: t(locale, 'testETitle'), desc: t(locale, 'testEDesc'), hint: t(locale, 'moveHint') };
-      case 'REPORT':
-        return null;
+    if (activeTab === 'ARENA') {
+      return { title: t(locale, 'arenaTitle'), desc: t(locale, 'arenaDesc'), hint: t(locale, 'arenaHint') };
     }
+    if (activeTab === 'STRESS') {
+      return { title: t(locale, 'stressTitle'), desc: t(locale, 'stressDesc'), hint: t(locale, 'stressHint') };
+    }
+    return null;
   })();
 
   return (
@@ -140,16 +159,20 @@ export default function App() {
       className="flex flex-col h-screen w-screen overflow-hidden bg-[#0B0E17] text-slate-100"
       data-active-tab={activeTab}
       data-engine={telemetry.engineKind}
+      data-grounded={telemetry.isGrounded ? 'true' : 'false'}
+      data-charge={telemetry.chargeRatio}
+      data-slime-y={telemetry.slimePos.y}
+      data-camera-yaw={telemetry.cameraYawDeg}
     >
-      {/* 3-Zone Top Bar Contract */}
-      <header className="flex items-center justify-between gap-4 sm:gap-8 px-4 sm:px-6 h-14 border-b border-slate-800 bg-[#0B0E17] shrink-0 z-30">
-        <span className="font-display text-base sm:text-lg font-semibold tracking-tight text-white whitespace-nowrap shrink-0">
+      {/* Top Header */}
+      <header className="flex items-center justify-between gap-2 sm:gap-8 px-3 sm:px-6 h-14 border-b border-slate-800 bg-[#0B0E17] shrink-0 z-30">
+        <span className="font-display text-sm sm:text-lg font-semibold tracking-tight text-white whitespace-nowrap shrink-0">
           {t(locale, 'brandTitle')}
         </span>
 
         <nav
-          aria-label="Testes do laboratório"
-          className="flex items-center gap-1.5 overflow-x-auto no-scrollbar py-1"
+          aria-label="Modos da Etapa 1"
+          className="flex items-center gap-1 sm:gap-1.5 overflow-x-auto no-scrollbar py-1"
         >
           {tabs.map((tab) => {
             const active = activeTab === tab.id;
@@ -158,7 +181,7 @@ export default function App() {
                 key={tab.id}
                 type="button"
                 onClick={() => handleSelectTab(tab.id)}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium whitespace-nowrap shrink-0 transition-colors min-h-[36px] ${
+                className={`px-2.5 sm:px-3 py-1.5 rounded-md text-xs font-medium whitespace-nowrap shrink-0 transition-colors min-h-[36px] ${
                   active
                     ? 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/40'
                     : 'text-slate-400 hover:text-slate-100 hover:bg-slate-800/60 border border-transparent'
@@ -200,43 +223,41 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main Stage */}
+      {/* Main Viewport */}
       <main className="relative flex-1 overflow-hidden">
-        {/* Isolated WebGL mount container */}
         <div
           ref={canvasHostRef}
           data-testid="lab-webgl-container"
           className="absolute inset-0 w-full h-full"
         />
 
-        {/* Subtle Top-Left Test Readout (unobtrusive, pointer-events-none) */}
         {activeTab !== 'REPORT' && activeInfo && (
-          <div className="pointer-events-none absolute top-3 left-4 right-4 sm:right-auto sm:max-w-md z-10 bg-[#0B0E17]/85 border border-slate-800 rounded-lg px-3.5 py-2.5">
-            <h1 className="font-display text-sm sm:text-base font-semibold text-white">
+          <div className="pointer-events-none absolute top-2.5 left-3 right-3 sm:top-3 sm:left-4 sm:right-auto sm:max-w-lg z-10 bg-[#0B0E17]/80 border border-slate-800 rounded-lg px-3 py-2 sm:px-3.5 sm:py-2.5">
+            <h1 className="font-display text-xs sm:text-base font-semibold text-white">
               {activeInfo.title}
             </h1>
-            <p className="text-xs text-slate-300 mt-0.5 leading-snug">
+            <p className="hidden sm:block text-xs text-slate-300 mt-0.5 leading-snug">
               {activeInfo.desc}
             </p>
-            <p className="text-[11px] font-mono text-cyan-300 mt-1">
+            <p className="text-[10px] sm:text-[11px] font-mono text-cyan-300 mt-0.5 sm:mt-1 leading-tight">
               {activeInfo.hint}
             </p>
           </div>
         )}
 
-        {/* Touch Virtual Sticks Overlay */}
+        {/* Touch Overlay: Left Stick + Impulse Button ONLY (Free screen drag controls camera) */}
         {activeTab !== 'REPORT' && (
           <TouchControlsOverlay
             visible={touchVisible}
+            leftStickLabel={t(locale, 'leftStickLabel')}
             chargeLabel={t(locale, 'chargeButton')}
             chargeRatio={telemetry.chargeRatio}
+            isGrounded={telemetry.isGrounded}
             onLeftStick={(x, y) => sceneMgrRef.current?.setTouchLeftStick(x, y)}
-            onRightStick={(x, y) => sceneMgrRef.current?.setTouchRightStick(x, y)}
             onChargeChange={(charging) => sceneMgrRef.current?.setTouchCharge(charging)}
           />
         )}
 
-        {/* Technical Evaluation Report Overlay */}
         {activeTab === 'REPORT' && (
           <div className="absolute inset-0 z-20 bg-[#0B0E17]">
             <TechReportView
@@ -247,12 +268,15 @@ export default function App() {
           </div>
         )}
 
-        {/* Collapsible Bottom Control & Telemetry Dock (no backdrop-filter over WebGL) */}
+        {/* Collapsible Bottom Control & Telemetry Dock */}
         {activeTab !== 'REPORT' && (
           <div className="fixed bottom-3 left-1/2 -translate-x-1/2 w-[min(960px,95vw)] z-30 flex flex-col items-center pointer-events-none">
             <button
               type="button"
-              onClick={() => setDockOpen((v) => !v)}
+              onClick={() => {
+                userToggledDockRef.current = true;
+                setDockOpen((v) => !v);
+              }}
               className="pointer-events-auto inline-flex items-center gap-1.5 px-3 py-1 rounded-t-md border border-b-0 border-slate-700 bg-[#0f172a] text-[11px] font-medium text-slate-300 hover:text-white min-h-[30px]"
             >
               {dockOpen ? (
@@ -270,17 +294,27 @@ export default function App() {
 
             {dockOpen && (
               <section
-                aria-label="Controles e telemetria do laboratório"
+                aria-label="Controles e telemetria da Etapa 1"
                 className="pointer-events-auto w-full rounded-lg border border-slate-700/90 bg-[#0f172a]/95 px-3.5 py-2.5 space-y-2.5"
               >
-                {/* Telemetry Readout Row (clean unboxed text with tabular-nums) */}
-                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] font-mono text-slate-300 border-b border-slate-800 pb-2">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] font-mono text-slate-300 border-b border-slate-800 pb-2 tabular-nums">
                   <span>
-                    {t(locale, 'metricFps')}: <strong className="text-white">{telemetry.fps}</strong>
+                    {t(locale, 'metricState')}:{' '}
+                    <strong className={telemetry.isGrounded ? 'text-emerald-400' : 'text-amber-300'}>
+                      {telemetry.isGrounded ? t(locale, 'stateGrounded') : t(locale, 'stateAirborne')}
+                    </strong>
                   </span>
                   <span aria-hidden="true" className="text-slate-600">·</span>
                   <span>
-                    {t(locale, 'metricFrameTime')}: <strong className="text-white">{telemetry.frameMs} ms</strong>
+                    {t(locale, 'metricCharge')}: <strong className="text-cyan-300">{Math.round(telemetry.chargeRatio * 100)}%</strong>
+                  </span>
+                  <span aria-hidden="true" className="text-slate-600">·</span>
+                  <span>
+                    Y: <strong className="text-white">{telemetry.slimePos.y} m</strong>
+                  </span>
+                  <span aria-hidden="true" className="text-slate-600">·</span>
+                  <span>
+                    {t(locale, 'metricFps')}: <strong className="text-white">{telemetry.fps}</strong>
                   </span>
                   <span aria-hidden="true" className="text-slate-600">·</span>
                   <span>
@@ -288,11 +322,7 @@ export default function App() {
                   </span>
                   <span aria-hidden="true" className="text-slate-600">·</span>
                   <span>
-                    {t(locale, 'metricBodies')}: <strong className="text-white">{telemetry.bodyCount}</strong>
-                  </span>
-                  <span aria-hidden="true" className="text-slate-600">·</span>
-                  <span>
-                    {t(locale, 'metricDrawCalls')}: <strong className="text-white">{telemetry.drawCalls}</strong>
+                    Yaw: <strong className="text-white">{telemetry.cameraYawDeg}°</strong>
                   </span>
                   {telemetry.heapMb !== null && (
                     <>
@@ -302,53 +332,11 @@ export default function App() {
                       </span>
                     </>
                   )}
-                  {activeTab === 'D' && (
-                    <>
-                      <span aria-hidden="true" className="text-slate-600">·</span>
-                      <span>
-                        Yaw: <strong className="text-cyan-300">{telemetry.cameraYawDeg}°</strong>
-                      </span>
-                      <span aria-hidden="true" className="text-slate-600">·</span>
-                      <span>
-                        {t(locale, 'metricGamepad')}:{' '}
-                        <strong className="text-slate-200">
-                          {telemetry.gamepadName ? telemetry.gamepadName : t(locale, 'gamepadDisconnected')}
-                        </strong>
-                      </span>
-                    </>
-                  )}
-                  {activeTab === 'C' && (
-                    <>
-                      <span aria-hidden="true" className="text-slate-600">·</span>
-                      <span>
-                        Alt. Balão: <strong className="text-sky-300">{telemetry.balloonAltitude} m</strong>
-                      </span>
-                      {telemetry.balloonInGoal && (
-                        <>
-                          <span aria-hidden="true" className="text-slate-600">·</span>
-                          <strong className="text-emerald-400">Alvo alcançado</strong>
-                        </>
-                      )}
-                    </>
-                  )}
                 </div>
 
-                {/* Interactive Controls Row */}
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex flex-wrap items-center gap-2">
-                    {/* Physics Engine Selector */}
                     <div className="flex items-center gap-1 bg-slate-900 border border-slate-800 rounded-md p-0.5">
-                      <button
-                        type="button"
-                        onClick={() => handleEngineChange('cannon')}
-                        className={`px-2.5 py-1 rounded text-xs font-medium whitespace-nowrap transition-colors min-h-[32px] ${
-                          engineKind === 'cannon'
-                            ? 'bg-cyan-500/20 text-cyan-300'
-                            : 'text-slate-400 hover:text-slate-200'
-                        }`}
-                      >
-                        {t(locale, 'engineCannon')}
-                      </button>
                       <button
                         type="button"
                         onClick={() => handleEngineChange('rapier')}
@@ -360,10 +348,20 @@ export default function App() {
                       >
                         {t(locale, 'engineRapier')}
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => handleEngineChange('cannon')}
+                        className={`px-2.5 py-1 rounded text-xs font-medium whitespace-nowrap transition-colors min-h-[32px] ${
+                          engineKind === 'cannon'
+                            ? 'bg-cyan-500/20 text-cyan-300'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        {t(locale, 'engineCannon')}
+                      </button>
                     </div>
 
-                    {/* Stress Body Count (Test E) */}
-                    {activeTab === 'E' && (
+                    {activeTab === 'STRESS' && (
                       <div className="flex items-center gap-1 bg-slate-900 border border-slate-800 rounded-md p-0.5">
                         {[12, 24, 48, 60].map((count) => (
                           <button
@@ -382,10 +380,9 @@ export default function App() {
                       </div>
                     )}
 
-                    {/* Touch Controls Toggle */}
                     <button
                       type="button"
-                      onClick={() => setTouchVisible((v) => !v)}
+                      onClick={handleToggleTouch}
                       className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-xs font-medium whitespace-nowrap min-h-[34px] transition-colors ${
                         touchVisible
                           ? 'border-purple-400/50 bg-purple-500/20 text-purple-200'
@@ -396,7 +393,6 @@ export default function App() {
                       <span>{t(locale, 'touchOverlayToggle')}</span>
                     </button>
 
-                    {/* Mobile Locale Switcher */}
                     <div className="flex sm:hidden items-center border border-slate-800 rounded-md overflow-hidden bg-slate-900">
                       {LOCALES.map((loc) => (
                         <button
@@ -413,7 +409,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Web Audio API Controls */}
                   <div className="flex flex-wrap items-center gap-2">
                     <button
                       type="button"
@@ -441,7 +436,7 @@ export default function App() {
                       <span>{musicPlaying ? t(locale, 'audioStopMusic') : t(locale, 'audioPlayMusic')}</span>
                     </button>
 
-                    {activeTab === 'E' && (
+                    {activeTab === 'STRESS' && (
                       <div className="flex items-center gap-2 text-[11px] text-slate-400 pl-1">
                         <label className="flex items-center gap-1">
                           <span>SFX</span>
