@@ -556,3 +556,362 @@ export function createImpulseArrow(): ImpulseArrowRig {
   group.add(shaft, head, ring);
   return { group, shaft, head, ring };
 }
+
+export interface BalloonRig {
+  root: THREE.Group;
+  visualGroup: THREE.Group;
+  tailGroup: THREE.Group;
+  popGroup: THREE.Group;
+  popShards: { mesh: THREE.Mesh; dir: THREE.Vector3; rotSpeed: THREE.Vector3 }[];
+  popRing: THREE.Mesh;
+  contactShadow: THREE.Mesh;
+  shaderUniforms: {
+    uTime: { value: number };
+    uWobble: { value: number };
+  };
+  radius: number;
+}
+
+function buildSoftBalloonGeometry(radius: number): THREE.SphereGeometry {
+  const geo = new THREE.SphereGeometry(radius, 28, 20);
+  const pos = geo.attributes.position;
+
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i);
+    const y = pos.getY(i);
+    const z = pos.getZ(i);
+
+    const ny = y / radius; // [-1, 1]
+    // Classic soft baby-balloon pear profile: fuller upper dome, softer taper toward knot
+    const profile = 1.0 + ny * 0.1 - Math.max(0, -ny) * 0.16;
+    // Slight low-air softness around upper shoulder
+    const angle = Math.atan2(z, x);
+    const softPouch = 1.0 + 0.024 * Math.sin(angle * 3.0 + ny * 2.0);
+    const sy = y * 1.08;
+
+    pos.setXYZ(i, x * profile * softPouch, sy, z * profile * softPouch);
+  }
+
+  geo.computeVertexNormals();
+  return geo;
+}
+
+export function createBalloonBabyRig(
+  radius = 0.5,
+  shadowTexture: THREE.Texture
+): BalloonRig {
+  const root = new THREE.Group();
+  const visualGroup = new THREE.Group();
+  root.add(visualGroup);
+
+  const shaderUniforms = {
+    uTime: { value: 0 },
+    uWobble: { value: 0 },
+  };
+
+  // 1. Soft translucent sky-blue balloon skin with gentle low-air ripple & Fresnel rim
+  const bodyGeo = buildSoftBalloonGeometry(radius);
+  const bodyMat = new THREE.MeshPhysicalMaterial({
+    color: new THREE.Color('#38bdf8'),
+    emissive: new THREE.Color('#0284c7'),
+    emissiveIntensity: 0.24,
+    roughness: 0.08,
+    metalness: 0.0,
+    clearcoat: 1.0,
+    clearcoatRoughness: 0.05,
+    ior: 1.38,
+    transparent: true,
+    opacity: 0.84,
+    depthWrite: false,
+  });
+
+  bodyMat.onBeforeCompile = (shader) => {
+    shader.uniforms.uTime = shaderUniforms.uTime;
+    shader.uniforms.uWobble = shaderUniforms.uWobble;
+
+    shader.vertexShader =
+      `
+      uniform float uTime;
+      uniform float uWobble;
+      varying vec3 vBalloonViewNormal;
+      varying vec3 vBalloonViewPos;
+      ` + shader.vertexShader;
+
+    shader.vertexShader = shader.vertexShader.replace(
+      '#include <begin_vertex>',
+      `
+      #include <begin_vertex>
+      float softBreath = sin(uTime * 2.4 + transformed.y * 3.0) * 0.012;
+      float impactRipple = sin(transformed.y * 6.5 - uTime * 11.0) * uWobble * 0.055;
+      transformed += normal * (softBreath + impactRipple);
+      `
+    );
+
+    shader.vertexShader = shader.vertexShader.replace(
+      '#include <project_vertex>',
+      `
+      #include <project_vertex>
+      vBalloonViewNormal = normalize(normalMatrix * objectNormal);
+      vBalloonViewPos = mvPosition.xyz;
+      `
+    );
+
+    shader.fragmentShader =
+      `
+      varying vec3 vBalloonViewNormal;
+      varying vec3 vBalloonViewPos;
+      ` + shader.fragmentShader;
+
+    shader.fragmentShader = shader.fragmentShader.replace(
+      '#include <dithering_fragment>',
+      `
+      vec3 bViewDir = normalize(-vBalloonViewPos);
+      float bFresnel = pow(1.0 - clamp(abs(dot(bViewDir, normalize(vBalloonViewNormal))), 0.0, 1.0), 2.4);
+      gl_FragColor.rgb += vec3(0.56, 0.88, 1.0) * bFresnel * 0.45;
+      gl_FragColor.a = clamp(gl_FragColor.a + bFresnel * 0.14, 0.0, 0.94);
+      #include <dithering_fragment>
+      `
+    );
+  };
+
+  const bodyMesh = new THREE.Mesh(bodyGeo, bodyMat);
+  bodyMesh.castShadow = true;
+  bodyMesh.renderOrder = 2;
+  visualGroup.add(bodyMesh);
+
+  // 2. Inner soft glowing heart/star core + 2 tiny air shimmer bubbles
+  const coreMesh = new THREE.Mesh(
+    new THREE.OctahedronGeometry(radius * 0.34, 1),
+    new THREE.MeshStandardMaterial({
+      color: '#e0f2fe',
+      emissive: '#38bdf8',
+      emissiveIntensity: 0.85,
+      roughness: 0.25,
+    })
+  );
+  coreMesh.position.y = radius * 0.05;
+  coreMesh.renderOrder = 1;
+  visualGroup.add(coreMesh);
+
+  // 3. Balloon knot & collar
+  const knotMat = new THREE.MeshStandardMaterial({
+    color: '#0284c7',
+    roughness: 0.5,
+  });
+  const knot = new THREE.Mesh(new THREE.ConeGeometry(radius * 0.15, radius * 0.22, 12), knotMat);
+  knot.position.y = -radius * 1.15;
+  visualGroup.add(knot);
+
+  const collar = new THREE.Mesh(new THREE.TorusGeometry(radius * 0.1, radius * 0.032, 8, 16), knotMat);
+  collar.rotation.x = Math.PI / 2;
+  collar.position.y = -radius * 1.06;
+  visualGroup.add(collar);
+
+  // 4. Swaying curved ribbon string beneath the knot
+  const tailGroup = new THREE.Group();
+  tailGroup.position.set(0, -radius * 1.16, 0);
+  const curve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(0, 0, 0),
+    new THREE.Vector3(0.07, -radius * 0.35, 0.04),
+    new THREE.Vector3(-0.06, -radius * 0.7, -0.03),
+    new THREE.Vector3(0.03, -radius * 1.0, 0.02),
+  ]);
+  const tailMesh = new THREE.Mesh(
+    new THREE.TubeGeometry(curve, 12, 0.02, 6, false),
+    new THREE.MeshStandardMaterial({ color: '#e0f2fe', roughness: 0.55 })
+  );
+  tailGroup.add(tailMesh);
+  visualGroup.add(tailGroup);
+
+  // 5. Cute expressive kawaii baby face (visible from front +Z toward camera and angled sides)
+  const scleraGeo = new THREE.SphereGeometry(radius * 0.135, 14, 10);
+  scleraGeo.scale(0.95, 1.12, 0.55);
+  const scleraMat = new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.2 });
+
+  const pupilGeo = new THREE.SphereGeometry(radius * 0.095, 12, 10);
+  pupilGeo.scale(0.95, 1.1, 0.55);
+  const pupilMat = new THREE.MeshStandardMaterial({ color: '#0f172a', roughness: 0.1 });
+
+  const catchGeo = new THREE.SphereGeometry(radius * 0.036, 8, 8);
+  const catchMat = new THREE.MeshBasicMaterial({ color: '#ffffff' });
+
+  [-1, 1].forEach((side) => {
+    const eyeGroup = new THREE.Group();
+    eyeGroup.position.set(side * radius * 0.27, radius * 0.14, radius * 0.9);
+    eyeGroup.rotation.y = side * 0.22;
+
+    const sclera = new THREE.Mesh(scleraGeo, scleraMat);
+    sclera.renderOrder = 3;
+
+    const pupil = new THREE.Mesh(pupilGeo, pupilMat);
+    pupil.position.set(0, -radius * 0.01, radius * 0.042);
+    pupil.renderOrder = 4;
+
+    const catchLight = new THREE.Mesh(catchGeo, catchMat);
+    catchLight.position.set(side * radius * 0.025, radius * 0.04, radius * 0.082);
+    catchLight.renderOrder = 5;
+
+    eyeGroup.add(sclera, pupil, catchLight);
+    visualGroup.add(eyeGroup);
+  });
+
+  const cheekGeo = new THREE.SphereGeometry(radius * 0.09, 10, 8);
+  const cheekMat = new THREE.MeshStandardMaterial({
+    color: '#f472b6',
+    roughness: 0.45,
+    transparent: true,
+    opacity: 0.8,
+  });
+  [-1, 1].forEach((side) => {
+    const cheek = new THREE.Mesh(cheekGeo, cheekMat);
+    cheek.scale.set(1.2, 0.65, 0.45);
+    cheek.position.set(side * radius * 0.44, -radius * 0.03, radius * 0.82);
+    cheek.renderOrder = 3;
+    visualGroup.add(cheek);
+  });
+
+  const babyMouth = new THREE.Mesh(
+    new THREE.TorusGeometry(radius * 0.06, radius * 0.018, 8, 14),
+    new THREE.MeshStandardMaterial({ color: '#0c4a6e', roughness: 0.3 })
+  );
+  babyMouth.position.set(0, -radius * 0.04, radius * 0.94);
+  babyMouth.renderOrder = 4;
+  visualGroup.add(babyMouth);
+
+  // 6. Pre-allocated pop burst group (hidden until fatal collision)
+  const popGroup = new THREE.Group();
+  popGroup.visible = false;
+  root.add(popGroup);
+
+  const shardGeo = new THREE.TetrahedronGeometry(radius * 0.18, 0);
+  const shardMatBlue = new THREE.MeshStandardMaterial({
+    color: '#38bdf8',
+    emissive: '#0ea5e9',
+    emissiveIntensity: 0.65,
+    roughness: 0.3,
+    transparent: true,
+    opacity: 0.95,
+  });
+  const shardMatWhite = new THREE.MeshStandardMaterial({
+    color: '#e0f2fe',
+    emissive: '#bae6fd',
+    emissiveIntensity: 0.5,
+    roughness: 0.3,
+    transparent: true,
+    opacity: 0.95,
+  });
+
+  const popShards: { mesh: THREE.Mesh; dir: THREE.Vector3; rotSpeed: THREE.Vector3 }[] = [];
+  for (let i = 0; i < 10; i++) {
+    const theta = (i / 10) * Math.PI * 2;
+    const elev = ((i % 3) - 0.5) * 0.7;
+    const dir = new THREE.Vector3(
+      Math.cos(theta) * Math.cos(elev),
+      Math.sin(elev) + 0.35,
+      Math.sin(theta) * Math.cos(elev)
+    ).normalize();
+    const mesh = new THREE.Mesh(shardGeo, i % 2 === 0 ? shardMatBlue : shardMatWhite);
+    popGroup.add(mesh);
+    popShards.push({
+      mesh,
+      dir,
+      rotSpeed: new THREE.Vector3(4 + (i % 3) * 2, 5 + (i % 2) * 3, 3 + i),
+    });
+  }
+
+  const popRing = new THREE.Mesh(
+    new THREE.RingGeometry(radius * 0.5, radius * 0.85, 24),
+    new THREE.MeshBasicMaterial({
+      color: '#7dd3fc',
+      transparent: true,
+      opacity: 0.9,
+      side: THREE.DoubleSide,
+    })
+  );
+  popRing.rotation.x = -Math.PI / 2;
+  popGroup.add(popRing);
+
+  // 7. Contact shadow
+  const shadowGeo = new THREE.CircleGeometry(radius * 1.15, 20);
+  shadowGeo.rotateX(-Math.PI / 2);
+  const shadowMat = new THREE.MeshBasicMaterial({
+    map: shadowTexture,
+    transparent: true,
+    depthWrite: false,
+    opacity: 0.45,
+  });
+  const contactShadow = new THREE.Mesh(shadowGeo, shadowMat);
+  contactShadow.position.y = 0.02;
+  root.add(contactShadow);
+
+  return {
+    root,
+    visualGroup,
+    tailGroup,
+    popGroup,
+    popShards,
+    popRing,
+    contactShadow,
+    shaderUniforms,
+    radius,
+  };
+}
+
+export function updateBalloonVisuals(
+  rig: BalloonRig,
+  velocity: { x: number; y: number; z: number },
+  wobble: number,
+  elapsed: number,
+  dt: number
+): void {
+  rig.shaderUniforms.uTime.value = elapsed;
+  rig.shaderUniforms.uWobble.value = wobble;
+
+  // Soft low-air sway + velocity banking tilt (never rigid spinning)
+  const targetTiltZ = THREE.MathUtils.clamp(-velocity.x * 0.055, -0.32, 0.32) + Math.sin(elapsed * 1.9) * 0.05;
+  const targetTiltX = THREE.MathUtils.clamp(velocity.z * 0.055, -0.32, 0.32) + Math.cos(elapsed * 1.5) * 0.04;
+  const blend = 1 - Math.exp(-8 * dt);
+  rig.visualGroup.rotation.z = THREE.MathUtils.lerp(rig.visualGroup.rotation.z, targetTiltZ, blend);
+  rig.visualGroup.rotation.x = THREE.MathUtils.lerp(rig.visualGroup.rotation.x, targetTiltX, blend);
+
+  // Gentle vertical stretch/squash from wobble & velocity
+  const squashY = 1 + Math.sin(elapsed * 10) * wobble * 0.12 + THREE.MathUtils.clamp(velocity.y * 0.015, -0.08, 0.12);
+  const squashXZ = 1 / Math.sqrt(Math.max(0.65, squashY));
+  rig.visualGroup.scale.set(squashXZ, squashY, squashXZ);
+
+  // Swaying ribbon string
+  rig.tailGroup.rotation.z = Math.sin(elapsed * 3.1) * 0.18 - velocity.x * 0.04;
+  rig.tailGroup.rotation.x = Math.cos(elapsed * 2.5) * 0.14 + velocity.z * 0.04;
+}
+
+export function updateBalloonPopEffect(rig: BalloonRig, popElapsed: number): void {
+  const duration = 0.48;
+  const t = Math.min(1, popElapsed / duration);
+  if (t >= 1) {
+    rig.popGroup.visible = false;
+    return;
+  }
+  rig.popGroup.visible = true;
+  const easeOut = 1 - Math.pow(1 - t, 3);
+  const dist = easeOut * 1.95;
+
+  for (let i = 0; i < rig.popShards.length; i++) {
+    const s = rig.popShards[i];
+    s.mesh.position.set(
+      s.dir.x * dist,
+      s.dir.y * dist - t * t * 0.85,
+      s.dir.z * dist
+    );
+    s.mesh.rotation.set(
+      s.rotSpeed.x * popElapsed,
+      s.rotSpeed.y * popElapsed,
+      s.rotSpeed.z * popElapsed
+    );
+    const scale = Math.max(0.01, 1 - t);
+    s.mesh.scale.setScalar(scale);
+  }
+
+  rig.popRing.scale.setScalar(1 + easeOut * 2.6);
+  (rig.popRing.material as THREE.MeshBasicMaterial).opacity = Math.max(0, 0.85 * (1 - t));
+}
+

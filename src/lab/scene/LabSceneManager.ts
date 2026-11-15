@@ -2,6 +2,11 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import type { TestId } from '../i18n/translations';
 import {
+  computeBalloonImpactImpulse,
+  computeWeakenedBalloonForce,
+  DEFAULT_BALLOON_PARAMS,
+} from '../math/balloonPhysics';
+import {
   computeAirborneVelocity,
   computeCameraRelativeDirection,
   computeGroundedVelocity,
@@ -21,16 +26,22 @@ import {
 } from '../physics/PhysicsEngine';
 import {
   createArenaFloorTextures,
+  createBalloonBabyRig,
   createContactShadowTexture,
   createImpulseArrow,
   createPurpleSlimeRig,
   createRampChevronTexture,
+  updateBalloonPopEffect,
+  updateBalloonVisuals,
   updateSlimeVisuals,
+  type BalloonRig,
   type ImpulseArrowRig,
   type SlimeExpressionState,
   type SlimeRig,
 } from './JellyMeshes';
 import type { WebAudioSynth } from '../audio/WebAudioSynth';
+
+export type AttemptState = 'playing' | 'popped';
 
 export interface LabTelemetry {
   fps: number;
@@ -48,6 +59,10 @@ export interface LabTelemetry {
   supportNormalY: number;
   slimePos: Vec3;
   slimeVelY: number;
+  balloonPos: Vec3;
+  balloonVelY: number;
+  attemptState: AttemptState;
+  popSurfaceId: string | null;
   impulseVec: Vec3;
   gamepadName: string | null;
   engineKind: PhysicsEngineKind;
@@ -72,14 +87,19 @@ const _dummyObj = new THREE.Object3D();
 const _targetCamPos = new THREE.Vector3();
 const _targetLook = new THREE.Vector3();
 
-// Stage 1 arena layout (single source of truth for visuals + physics + shadow projection)
+const FIXED_SUBSTEP_DT = 1 / 60;
+const MAX_SUBSTEPS_PER_FRAME = 4;
+
+// Arena surfaces (single source of truth for visuals, colliders, and shadow projection)
 const ARENA_PLATFORMS: PlatformBoxSpec[] = [
   { id: 'plat-low', pos: [-4.8, 0.3, -1.5], size: [3.8, 0.6, 3.8], color: '#1e293b', trimColor: '#38bdf8' },
   { id: 'plat-med', pos: [5.5, 0.7, -4.5], size: [4.6, 1.4, 4.6], color: '#273549', trimColor: '#22d3ee' },
   { id: 'plat-high', pos: [0.0, 1.25, -9.2], size: [4.8, 2.5, 3.8], color: '#334155', trimColor: '#a855f7' },
-  // Vertical test walls (for validating lateral wall collision does NOT grant jump)
+  // Vertical test walls (lateral contact check + fatal balloon wall check)
   { id: 'wall-test-a', pos: [-2.6, 1.3, 1.8], size: [1.1, 2.6, 2.4], color: '#475569', trimColor: '#f59e0b', restitution: 0.2 },
   { id: 'wall-test-b', pos: [2.4, 1.3, -6.5], size: [1.1, 2.6, 2.4], color: '#475569', trimColor: '#f59e0b', restitution: 0.2 },
+  // Overhead ceiling test beam above low platform so ceiling collisions can be tested cleanly
+  { id: 'ceiling-test', pos: [-4.8, 4.35, -1.5], size: [3.6, 0.34, 2.2], color: '#334155', trimColor: '#fb7185', restitution: 0.15 },
 ];
 
 // Inclined ramp connecting floor (y=0, z=1.8) up to plat-med front edge (y=1.4, z=-2.2)
@@ -125,6 +145,7 @@ export class LabSceneManager {
 
   private shadowTexture: THREE.CanvasTexture;
   private slimeRig: SlimeRig;
+  private balloonRig: BalloonRig | null = null;
   private impulseArrow: ImpulseArrowRig;
 
   private dynamicGroup = new THREE.Group();
@@ -134,6 +155,7 @@ export class LabSceneManager {
 
   private physics: IPhysicsWorld | null = null;
   private slimeBody: PhysicsBodyHandle | null = null;
+  private balloonBody: PhysicsBodyHandle | null = null;
 
   private activeTest: TestId = 'ARENA';
   private engineKind: PhysicsEngineKind = 'rapier';
@@ -153,9 +175,9 @@ export class LabSceneManager {
   // Camera state
   private cameraYaw = 0.25;
   private cameraPitch = 0.4;
-  private cameraDistance = 8.4;
-  private smoothedCamPos = new THREE.Vector3(2.0, 4.2, 11.4);
-  private smoothedLookTarget = new THREE.Vector3(0, 0.9, 4.0);
+  private cameraDistance = 8.8;
+  private smoothedCamPos = new THREE.Vector3(2.0, 4.4, 11.8);
+  private smoothedLookTarget = new THREE.Vector3(0, 1.3, 3.2);
 
   // Slime physics, charge & squash state
   private chargeState: ChargeState = { isCharging: false, chargeRatio: 0 };
@@ -165,6 +187,15 @@ export class LabSceneManager {
   private landingExprTimer = 0;
   private squashState: SquashSpringState = { scaleY: 1, velocityY: 0, scaleXZ: 1 };
   private wobbleEnergy = 0;
+
+  // Balloon Baby state (Stage 2)
+  private attemptState: AttemptState = 'playing';
+  private popSurfaceId: string | null = null;
+  private popElapsed = 0;
+  private balloonWobble = 0;
+  private balloonBumpCooldown = 0;
+  private simTime = 0;
+  private physicsAccum = 0;
   private elapsed = 0;
 
   // Loop & telemetry
@@ -274,7 +305,6 @@ export class LabSceneManager {
     const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
     const { map, bumpMap } = createArenaFloorTextures(maxAniso);
 
-    // Arena ground slab (top surface at y = 0)
     const ground = new THREE.Mesh(
       new THREE.BoxGeometry(36, 1, 36),
       new THREE.MeshStandardMaterial({
@@ -290,7 +320,6 @@ export class LabSceneManager {
     ground.receiveShadow = true;
     this.scene.add(ground);
 
-    // Horizon skirt
     const skirtGeo = new THREE.RingGeometry(18, 80, 48);
     skirtGeo.rotateX(-Math.PI / 2);
     const skirt = new THREE.Mesh(
@@ -304,7 +333,6 @@ export class LabSceneManager {
     skirt.position.y = -0.06;
     this.scene.add(skirt);
 
-    // Stage 1 platforms & vertical test walls
     ARENA_PLATFORMS.forEach((p) => {
       const mesh = new THREE.Mesh(
         new THREE.BoxGeometry(...p.size),
@@ -334,7 +362,6 @@ export class LabSceneManager {
       }
     });
 
-    // Inclined ramp with directional chevron texture
     const rampTex = createRampChevronTexture(maxAniso);
     const rampMesh = new THREE.Mesh(
       new THREE.BoxGeometry(RAMP_WIDTH, RAMP_THICKNESS, RAMP_LENGTH),
@@ -351,7 +378,6 @@ export class LabSceneManager {
     rampMesh.receiveShadow = true;
     this.scene.add(rampMesh);
 
-    // Launch calibration pad ring at spawn (x=0, z=4.0)
     const padGeo = new THREE.RingGeometry(1.05, 1.22, 32);
     padGeo.rotateX(-Math.PI / 2);
     const padMat = new THREE.MeshBasicMaterial({
@@ -364,7 +390,6 @@ export class LabSceneManager {
     pad.position.set(0, 0.02, 4.0);
     this.scene.add(pad);
 
-    // Natural perimeter orientation landmarks
     const pillarMat = new THREE.MeshStandardMaterial({ color: '#1e293b', roughness: 0.75 });
     const capMat = new THREE.MeshStandardMaterial({
       color: '#38bdf8',
@@ -428,6 +453,18 @@ export class LabSceneManager {
   }
 
   private clearDynamicScenario() {
+    if (this.balloonRig) {
+      this.dynamicGroup.remove(this.balloonRig.root);
+      this.balloonRig.root.traverse((obj) => {
+        if ((obj as THREE.Mesh).isMesh) {
+          const m = obj as THREE.Mesh;
+          m.geometry.dispose();
+          if (Array.isArray(m.material)) m.material.forEach((mat) => mat.dispose());
+          else m.material.dispose();
+        }
+      });
+      this.balloonRig = null;
+    }
     if (this.stressBoxesMesh) {
       this.dynamicGroup.remove(this.stressBoxesMesh);
       this.stressBoxesMesh.geometry.dispose();
@@ -441,6 +478,7 @@ export class LabSceneManager {
       this.stressSpheresMesh = null;
     }
     this.stressProps = [];
+    this.balloonBody = null;
     this.slimeBody = null;
 
     if (this.physics) {
@@ -465,10 +503,8 @@ export class LabSceneManager {
       }
       this.physics = world;
 
-      // Ground collider
       world.addStaticBox('ground', { x: 0, y: -0.5, z: 0 }, { x: 18, y: 0.5, z: 18 }, 0.08);
 
-      // Platforms & vertical walls
       ARENA_PLATFORMS.forEach((p) => {
         world.addStaticBox(
           p.id,
@@ -478,7 +514,6 @@ export class LabSceneManager {
         );
       });
 
-      // Inclined ramp collider
       world.addStaticBox(
         'ramp-med',
         { x: RAMP_POS[0], y: RAMP_POS[1], z: RAMP_POS[2] },
@@ -487,13 +522,12 @@ export class LabSceneManager {
         { x: Math.sin(RAMP_ANGLE / 2), y: 0, z: 0, w: Math.cos(RAMP_ANGLE / 2) }
       );
 
-      // Low perimeter curbs
       world.addStaticBox('wall-n', { x: 0, y: 0.6, z: -17.5 }, { x: 18, y: 0.8, z: 0.5 }, 0.35);
       world.addStaticBox('wall-s', { x: 0, y: 0.6, z: 17.5 }, { x: 18, y: 0.8, z: 0.5 }, 0.35);
       world.addStaticBox('wall-e', { x: 17.5, y: 0.6, z: 0 }, { x: 0.5, y: 0.8, z: 18 }, 0.35);
       world.addStaticBox('wall-w', { x: -17.5, y: 0.6, z: 0 }, { x: 0.5, y: 0.8, z: 18 }, 0.35);
 
-      // Protagonist purple slime (canSleep: false ensures contact manifolds stay active while resting)
+      // Protagonist purple slime (CCD enabled for reliable collision with fast balloon/walls)
       this.slimeBody = world.addDynamicSphere(
         'slime',
         { x: 0, y: 0.65, z: 4.0 },
@@ -505,15 +539,46 @@ export class LabSceneManager {
           linearDamping: 0.18,
           angularDamping: 0.65,
           canSleep: false,
+          ccdEnabled: true,
         }
       );
 
-      // Perform one settle step so initial contact manifold is populated immediately
-      world.step(1 / 60);
+      // Balloon Baby in main Arena mode (Stage 2)
+      if (this.activeTest === 'ARENA') {
+        this.balloonRig = createBalloonBabyRig(0.5, this.shadowTexture);
+        this.dynamicGroup.add(this.balloonRig.root);
+        this.balloonBody = world.addDynamicSphere(
+          'balloon-baby',
+          { x: 0, y: 2.55, z: 1.8 },
+          0.5,
+          DEFAULT_BALLOON_PARAMS.mass,
+          {
+            restitution: 0.56,
+            friction: 0.12,
+            linearDamping: 0.24,
+            angularDamping: 0.85,
+            canSleep: false,
+            ccdEnabled: true,
+          }
+        );
+        // Gentle initial upward lift so player has calm reaction window on spawn
+        this.balloonBody.setVelocity({ x: 0, y: 0.35, z: 0 });
+        this.balloonRig.root.position.set(0, 2.55, 1.8);
+      }
+
+      world.step(FIXED_SUBSTEP_DT);
       const initSupport = world.getSupportContact(this.slimeBody);
       this.isGrounded = initSupport.grounded;
       this.wasGrounded = initSupport.grounded;
       this.supportNormalY = initSupport.normalY;
+
+      this.attemptState = 'playing';
+      this.popSurfaceId = null;
+      this.popElapsed = 0;
+      this.balloonWobble = 0;
+      this.balloonBumpCooldown = 0;
+      this.simTime = 0;
+      this.physicsAccum = 0;
 
       this.chargeState = { isCharging: false, chargeRatio: 0 };
       this.squashState = { scaleY: 1, velocityY: 0, scaleXZ: 1 };
@@ -599,14 +664,35 @@ export class LabSceneManager {
         this.dynamicGroup.add(this.stressBoxesMesh, this.stressSpheresMesh);
       }
 
-      // Snap camera smoothly behind slime at slight 3/4 angle; greet player with expressive face until movement starts
       this.cameraYaw = 0.25;
       this.slimeRig.visualGroup.rotation.y = 2.68;
-      this.smoothedLookTarget.set(0, 1.1, 4.0);
-      this.smoothedCamPos.set(1.9, 4.2, 11.5);
+      this.smoothedLookTarget.set(0, 1.3, 3.2);
+      this.smoothedCamPos.set(2.0, 4.4, 11.8);
+      this.emitTelemetryNow();
     } finally {
       this.rebuilding = false;
     }
+  }
+
+  private triggerBalloonPop(surfaceId: string) {
+    if (this.attemptState === 'popped') return;
+    this.attemptState = 'popped';
+    this.popSurfaceId = surfaceId;
+    this.popElapsed = 0;
+    this.chargeState = { isCharging: false, chargeRatio: 0 };
+
+    if (this.balloonBody) {
+      this.balloonBody.setEnabled(false);
+    }
+    if (this.balloonRig) {
+      this.balloonRig.visualGroup.visible = false;
+      this.balloonRig.contactShadow.visible = false;
+      this.balloonRig.popGroup.visible = true;
+      updateBalloonPopEffect(this.balloonRig, 0.01);
+    }
+
+    this.audio.playBalloonPop();
+    this.emitTelemetryNow();
   }
 
   private bindInputEvents() {
@@ -625,10 +711,18 @@ export class LabSceneManager {
     this.keys.add(code);
     if (code === 'Space') {
       e.preventDefault();
-      if (!this.keyCharging) {
-        void this.audio.unlock();
+      if (this.attemptState === 'playing') {
+        if (!this.keyCharging) {
+          void this.audio.unlock();
+        }
+        this.keyCharging = true;
       }
-      this.keyCharging = true;
+    } else if (
+      this.attemptState === 'popped' &&
+      (code === 'KeyR' || code === 'Enter')
+    ) {
+      e.preventDefault();
+      void this.resetScenario();
     }
   };
 
@@ -732,31 +826,141 @@ export class LabSceneManager {
     };
   }
 
-  /**
-   * Computes highest supporting surface Y directly beneath (x, z) below slimeY
-   * for crisp contact shadow grounding across platforms and floor.
-   */
-  private sampleSurfaceHeightBelow(x: number, slimeY: number, z: number): number {
+  private sampleSurfaceHeightBelow(x: number, objY: number, z: number): number {
     let highest = 0;
     for (let i = 0; i < ARENA_PLATFORMS.length; i++) {
       const p = ARENA_PLATFORMS[i];
       const topY = p.pos[1] + p.size[1] / 2;
-      if (topY > slimeY + 0.05) continue;
+      if (topY > objY + 0.05) continue;
       const hx = p.size[0] / 2;
       const hz = p.size[2] / 2;
       if (Math.abs(x - p.pos[0]) <= hx && Math.abs(z - p.pos[2]) <= hz) {
         if (topY > highest) highest = topY;
       }
     }
-    // Check inclined ramp footprint (x in [5.5 - 1.3, 5.5 + 1.3], z in [-2.2, 1.8])
     if (Math.abs(x - RAMP_POS[0]) <= RAMP_WIDTH / 2 && z >= -2.2 && z <= 1.8) {
       const t = (1.8 - z) / RAMP_RUN;
       const rampY = t * RAMP_RISE;
-      if (rampY <= slimeY + 0.1 && rampY > highest) {
+      if (rampY <= objY + 0.1 && rampY > highest) {
         highest = rampY;
       }
     }
     return highest;
+  }
+
+  private stepGameplaySubstep(
+    subDt: number,
+    input: { moveX: number; moveY: number; charging: boolean },
+    worldDir: Vec3
+  ) {
+    if (!this.physics || !this.slimeBody || this.attemptState !== 'playing') return;
+
+    const preTf = this.slimeBody.getTransform();
+    const preSupport = this.physics.getSupportContact(this.slimeBody);
+    this.isGrounded = preSupport.grounded;
+    this.supportNormalY = preSupport.normalY;
+
+    const curVel = this.slimeBody.getVelocity();
+    if (this.isGrounded) {
+      const groundMaxSpeed = this.chargeState.isCharging ? 2.4 : 6.4;
+      const nextVel = computeGroundedVelocity(curVel, worldDir, groundMaxSpeed, 9.5, subDt);
+      this.slimeBody.setVelocity(nextVel);
+    } else {
+      const nextVel = computeAirborneVelocity(curVel, worldDir, 5.4, 6.2, subDt);
+      if (nextVel !== curVel) {
+        this.slimeBody.setVelocity(nextVel);
+      }
+    }
+
+    const chargeRes = stepChargeState(this.chargeState, input.charging, this.isGrounded, subDt, 0.95);
+    this.chargeState = chargeRes.nextState;
+
+    if (this.chargeState.isCharging) {
+      this.audio.playChargeTick(this.chargeState.chargeRatio);
+    } else if (chargeRes.shouldLaunch) {
+      const launch = computeImpulseVector(
+        input.moveX,
+        input.moveY,
+        this.cameraYaw,
+        chargeRes.launchRatio
+      );
+      this.slimeBody.applyImpulse(launch);
+      this.squashState.scaleY = 1.42;
+      this.squashState.velocityY = 2.6;
+      this.wobbleEnergy = 1.0;
+      this.audio.playLaunch(chargeRes.launchRatio);
+      this.isGrounded = false;
+      this.wasGrounded = false;
+    }
+
+    // Apply weakened buoyancy + gentle air cushion to Balloon Baby
+    this.simTime += subDt;
+    if (this.balloonBody) {
+      const bVel = this.balloonBody.getVelocity();
+      const lift = computeWeakenedBalloonForce(bVel.y, this.simTime);
+      this.balloonBody.applyForce({ x: 0, y: lift, z: 0 });
+    }
+
+    this.physics.step(subDt);
+
+    if (this.balloonBumpCooldown > 0) {
+      this.balloonBumpCooldown = Math.max(0, this.balloonBumpCooldown - subDt);
+    }
+
+    // Balloon collision check immediately after every fixed substep (anti-tunneling & zero safety margin)
+    if (this.balloonBody) {
+      const bCol = this.physics.getBodyCollisions(this.balloonBody, ['slime']);
+      if (bCol.hitSurfaceId !== null) {
+        this.triggerBalloonPop(bCol.hitSurfaceId);
+        return;
+      }
+
+      if (bCol.hitBodyIds.includes('slime') && this.balloonBumpCooldown <= 0) {
+        const sTf = this.slimeBody.getTransform();
+        const bTf = this.balloonBody.getTransform();
+        const impactImpulse = computeBalloonImpactImpulse(
+          sTf.position,
+          sTf.velocity,
+          bTf.position,
+          bTf.velocity,
+          DEFAULT_BALLOON_PARAMS.mass
+        );
+        if (impactImpulse) {
+          this.balloonBody.applyImpulse(impactImpulse);
+          this.balloonBumpCooldown = 0.14;
+          this.balloonWobble = 1.0;
+          this.wobbleEnergy = Math.max(this.wobbleEnergy, 0.78);
+          this.audio.playBalloonChime();
+        }
+      }
+
+      // Safety out-of-bounds surface check
+      const bPos = this.balloonBody.getTransform().position;
+      if (bPos.y < -2) {
+        this.triggerBalloonPop('out-of-bounds');
+        return;
+      }
+    }
+
+    // Slime landing feedback
+    const nextSlime = this.slimeBody.getTransform();
+    const postSupport = this.physics.getSupportContact(this.slimeBody);
+    this.isGrounded = postSupport.grounded;
+    this.supportNormalY = postSupport.normalY;
+
+    if (!this.wasGrounded && postSupport.grounded && preTf.velocity.y < -2.2) {
+      const impact = Math.min(1, Math.abs(preTf.velocity.y) / 11);
+      this.squashState.scaleY = Math.max(0.54, 1 - impact * 0.44);
+      this.squashState.velocityY = -impact * 4.8;
+      this.wobbleEnergy = Math.min(1.2, this.wobbleEnergy + impact * 0.95);
+      this.landingExprTimer = 0.2;
+      this.audio.playBounce(impact);
+    }
+    this.wasGrounded = postSupport.grounded;
+
+    if (nextSlime.position.y < -4) {
+      this.slimeBody.setPosition({ x: 0, y: 1.5, z: 4.0 });
+    }
   }
 
   private tick = () => {
@@ -765,12 +969,12 @@ export class LabSceneManager {
     const now = performance.now();
     const rawDt = (now - this.lastFrameTs) / 1000;
     this.lastFrameTs = now;
-    const dt = Math.min(0.05, Math.max(0.001, rawDt));
+    const dt = Math.min(0.065, Math.max(0.001, rawDt));
     this.elapsed += dt;
 
     const input = this.readCombinedInput();
 
-    // Independent camera rotation (Gamepad right stick + pointer drag)
+    // Independent camera rotation remains active even after pop so player can inspect what hit
     this.cameraYaw -= input.camX * dt * 2.3;
     this.cameraPitch = THREE.MathUtils.clamp(this.cameraPitch - input.camY * dt * 1.4, 0.16, 1.15);
 
@@ -778,81 +982,46 @@ export class LabSceneManager {
     const moveMag = Math.hypot(worldDir.x, worldDir.z);
 
     if (this.physics && this.slimeBody) {
-      const preTf = this.slimeBody.getTransform();
-      const preSupport = this.physics.getSupportContact(this.slimeBody);
-      this.isGrounded = preSupport.grounded;
-      this.supportNormalY = preSupport.normalY;
-
-      // Grounded vs airborne velocity handling (preserves ballistic trajectory in air)
-      const curVel = this.slimeBody.getVelocity();
-      if (this.isGrounded) {
-        const groundMaxSpeed = this.chargeState.isCharging ? 2.4 : 6.4;
-        const nextVel = computeGroundedVelocity(curVel, worldDir, groundMaxSpeed, 9.5, dt);
-        this.slimeBody.setVelocity(nextVel);
+      if (this.attemptState === 'playing') {
+        this.physicsAccum = Math.min(this.physicsAccum + dt, FIXED_SUBSTEP_DT * MAX_SUBSTEPS_PER_FRAME);
+        let steps = 0;
+        while (
+          this.physicsAccum >= FIXED_SUBSTEP_DT &&
+          steps < MAX_SUBSTEPS_PER_FRAME &&
+          this.attemptState === 'playing'
+        ) {
+          this.stepGameplaySubstep(FIXED_SUBSTEP_DT, input, worldDir);
+          this.physicsAccum -= FIXED_SUBSTEP_DT;
+          steps++;
+        }
+        // Ensure at least one step runs on slow software WebGL frames
+        if (steps === 0 && this.attemptState === 'playing') {
+          this.stepGameplaySubstep(Math.min(dt, FIXED_SUBSTEP_DT), input, worldDir);
+          this.physicsAccum = 0;
+        }
       } else {
-        const nextVel = computeAirborneVelocity(curVel, worldDir, 5.4, 6.2, dt);
-        if (nextVel !== curVel) {
-          this.slimeBody.setVelocity(nextVel);
+        this.popElapsed += dt;
+        if (this.balloonRig) {
+          updateBalloonPopEffect(this.balloonRig, this.popElapsed);
         }
       }
-
-      // Strict grounded-only charge & single impulse launch
-      const chargeRes = stepChargeState(this.chargeState, input.charging, this.isGrounded, dt, 0.95);
-      this.chargeState = chargeRes.nextState;
-
-      if (this.chargeState.isCharging) {
-        this.audio.playChargeTick(this.chargeState.chargeRatio);
-      } else if (chargeRes.shouldLaunch) {
-        const launch = computeImpulseVector(
-          input.moveX,
-          input.moveY,
-          this.cameraYaw,
-          chargeRes.launchRatio
-        );
-        this.slimeBody.applyImpulse(launch);
-        this.squashState.scaleY = 1.42;
-        this.squashState.velocityY = 2.6;
-        this.wobbleEnergy = 1.0;
-        this.audio.playLaunch(chargeRes.launchRatio);
-        this.isGrounded = false;
-        this.wasGrounded = false;
-      }
-
-      this.physics.step(dt);
-
-      const nextSlime = this.slimeBody.getTransform();
-      const postSupport = this.physics.getSupportContact(this.slimeBody);
-      this.isGrounded = postSupport.grounded;
-      this.supportNormalY = postSupport.normalY;
-
-      // Landing detection from real air-to-ground contact transition
-      if (!this.wasGrounded && postSupport.grounded && preTf.velocity.y < -2.2) {
-        const impact = Math.min(1, Math.abs(preTf.velocity.y) / 11);
-        this.squashState.scaleY = Math.max(0.54, 1 - impact * 0.44);
-        this.squashState.velocityY = -impact * 4.8;
-        this.wobbleEnergy = Math.min(1.2, this.wobbleEnergy + impact * 0.95);
-        this.landingExprTimer = 0.2;
-        this.audio.playBounce(impact);
-      }
-      this.wasGrounded = postSupport.grounded;
 
       if (this.landingExprTimer > 0) {
         this.landingExprTimer = Math.max(0, this.landingExprTimer - dt);
       }
 
-      // Safety recovery if slime escapes arena
-      if (nextSlime.position.y < -4) {
-        this.slimeBody.setPosition({ x: 0, y: 1.5, z: 4.0 });
-      }
+      const nextSlime = this.slimeBody.getTransform();
 
       // Decoupled visual squash-stretch spring
-      const targetScaleY = this.chargeState.isCharging
-        ? 1 - this.chargeState.chargeRatio * 0.45
-        : !this.isGrounded && nextSlime.velocity.y > 1.5
-          ? 1.12
-          : 1.0;
+      const targetScaleY =
+        this.attemptState === 'playing' && this.chargeState.isCharging
+          ? 1 - this.chargeState.chargeRatio * 0.45
+          : !this.isGrounded && nextSlime.velocity.y > 1.5
+            ? 1.12
+            : 1.0;
       this.squashState = stepSquashSpring(this.squashState, targetScaleY, 240, 14, dt);
       this.wobbleEnergy = Math.max(0, this.wobbleEnergy - dt * 1.35);
+      this.balloonWobble = Math.max(0, this.balloonWobble - dt * 1.6);
 
       const r = this.slimeRig.radius;
       this.slimeRig.root.position.set(
@@ -867,7 +1036,7 @@ export class LabSceneManager {
       );
       this.slimeRig.visualGroup.position.y = -r * (1 - this.squashState.scaleY);
 
-      if (moveMag > 0.08) {
+      if (this.attemptState === 'playing' && moveMag > 0.08) {
         const targetFaceYaw = Math.atan2(-worldDir.x, -worldDir.z);
         const curY = this.slimeRig.visualGroup.rotation.y;
         let diff = targetFaceYaw - curY;
@@ -876,7 +1045,6 @@ export class LabSceneManager {
         this.slimeRig.visualGroup.rotation.y += diff * (1 - Math.exp(-11 * dt));
       }
 
-      // Dynamic expression state
       const expr: SlimeExpressionState =
         this.landingExprTimer > 0
           ? 'landing'
@@ -889,7 +1057,6 @@ export class LabSceneManager {
                 : 'idle';
       updateSlimeVisuals(this.slimeRig, expr, this.chargeState.chargeRatio, this.elapsed, dt);
 
-      // Contact shadow tracks supporting surface beneath slime
       const surfY = this.sampleSurfaceHeightBelow(nextSlime.position.x, nextSlime.position.y, nextSlime.position.z);
       const heightAboveSurf = Math.max(0, nextSlime.position.y - r - surfY);
       this.slimeRig.contactShadow.position.y = surfY - nextSlime.position.y + 0.025;
@@ -900,14 +1067,28 @@ export class LabSceneManager {
       this.slimeRig.shaderUniforms.uWobble.value = this.wobbleEnergy;
       this.slimeRig.shaderUniforms.uCharge.value = this.chargeState.chargeRatio;
 
-      // 3D launch direction arrow (shown when grounded and charging or aiming)
+      // Update Balloon Baby visual rig
+      if (this.balloonRig && this.balloonBody && this.attemptState === 'playing') {
+        const bTf = this.balloonBody.getTransform();
+        this.balloonRig.root.position.set(bTf.position.x, bTf.position.y, bTf.position.z);
+        updateBalloonVisuals(this.balloonRig, bTf.velocity, this.balloonWobble, this.elapsed, dt);
+        const bSurfY = this.sampleSurfaceHeightBelow(bTf.position.x, bTf.position.y, bTf.position.z);
+        const bHeight = Math.max(0, bTf.position.y - this.balloonRig.radius - bSurfY);
+        this.balloonRig.contactShadow.position.y = bSurfY - bTf.position.y + 0.025;
+        this.balloonRig.contactShadow.scale.setScalar(Math.max(0.32, 1 - bHeight * 0.11));
+      }
+
+      // 3D launch direction arrow (grounded only; no aiming reticle for balloon)
       const impulsePreview = computeImpulseVector(
         input.moveX,
         input.moveY,
         this.cameraYaw,
         Math.max(0.25, this.chargeState.chargeRatio)
       );
-      const showArrow = this.isGrounded && (this.chargeState.isCharging || moveMag > 0.15);
+      const showArrow =
+        this.attemptState === 'playing' &&
+        this.isGrounded &&
+        (this.chargeState.isCharging || moveMag > 0.15);
       this.impulseArrow.group.visible = showArrow;
       if (showArrow) {
         this.impulseArrow.group.position.set(
@@ -953,7 +1134,7 @@ export class LabSceneManager {
       // Smooth third-person camera follow
       _targetLook.set(
         nextSlime.position.x,
-        nextSlime.position.y + 0.55,
+        nextSlime.position.y + 0.65,
         nextSlime.position.z
       );
       const horizDist = Math.cos(this.cameraPitch) * this.cameraDistance;
@@ -978,56 +1159,70 @@ export class LabSceneManager {
       if (this.fpsSamples.length > 20) this.fpsSamples.shift();
     }
 
-    // Throttle React telemetry callback to <= 6 Hz
     if (now - this.lastTelemetryTs > 165) {
       this.lastTelemetryTs = now;
-      const avgFps =
-        this.fpsSamples.length > 0
-          ? this.fpsSamples.reduce((a, b) => a + b, 0) / this.fpsSamples.length
-          : 0;
-      const perfMem = (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory;
-      const heapMb = perfMem ? perfMem.usedJSHeapSize / (1024 * 1024) : null;
-      const slimeTf = this.slimeBody?.getTransform();
-      const deg = (((this.cameraYaw * 180) / Math.PI) % 360 + 360) % 360;
-
-      const impulsePreview = computeImpulseVector(
-        input.moveX,
-        input.moveY,
-        this.cameraYaw,
-        Math.max(0.25, this.chargeState.chargeRatio)
-      );
-
-      this.onTelemetry({
-        fps: Math.round(avgFps),
-        frameMs: Number(this.currentFrameMs.toFixed(1)),
-        physicsMs: Number((this.physics?.lastStepMs ?? 0).toFixed(2)),
-        bodyCount: this.physics?.bodyCount() ?? 0,
-        drawCalls: this.renderer.info.render.calls,
-        triangles: this.renderer.info.render.triangles,
-        heapMb: heapMb !== null ? Number(heapMb.toFixed(1)) : null,
-        rendererName: this.rendererLabel,
-        isSoftwareGl: this.isSoftwareGl,
-        cameraYawDeg: Math.round(deg),
-        chargeRatio: Number(this.chargeState.chargeRatio.toFixed(2)),
-        isGrounded: this.isGrounded,
-        supportNormalY: Number(this.supportNormalY.toFixed(2)),
-        slimePos: slimeTf
-          ? {
-              x: Number(slimeTf.position.x.toFixed(2)),
-              y: Number(slimeTf.position.y.toFixed(2)),
-              z: Number(slimeTf.position.z.toFixed(2)),
-            }
-          : { x: 0, y: 0.65, z: 4.0 },
-        slimeVelY: slimeTf ? Number(slimeTf.velocity.y.toFixed(2)) : 0,
-        impulseVec: impulsePreview,
-        gamepadName: input.gamepadName,
-        engineKind: this.engineKind,
-        rapierReady: this.rapierReady,
-      });
+      this.emitTelemetryNow(input);
     }
 
     this.scheduleNextTick();
   };
+
+  private emitTelemetryNow(input?: { moveX: number; moveY: number; gamepadName: string | null }) {
+    const avgFps =
+      this.fpsSamples.length > 0
+        ? this.fpsSamples.reduce((a, b) => a + b, 0) / this.fpsSamples.length
+        : 0;
+    const perfMem = (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory;
+    const heapMb = perfMem ? perfMem.usedJSHeapSize / (1024 * 1024) : null;
+    const slimeTf = this.slimeBody?.getTransform();
+    const balloonTf = this.balloonBody?.getTransform();
+    const deg = (((this.cameraYaw * 180) / Math.PI) % 360 + 360) % 360;
+
+    const impulsePreview = computeImpulseVector(
+      input?.moveX ?? 0,
+      input?.moveY ?? 0,
+      this.cameraYaw,
+      Math.max(0.25, this.chargeState.chargeRatio)
+    );
+
+    this.onTelemetry({
+      fps: Math.round(avgFps),
+      frameMs: Number(this.currentFrameMs.toFixed(1)),
+      physicsMs: Number((this.physics?.lastStepMs ?? 0).toFixed(2)),
+      bodyCount: this.physics?.bodyCount() ?? 0,
+      drawCalls: this.renderer.info.render.calls,
+      triangles: this.renderer.info.render.triangles,
+      heapMb: heapMb !== null ? Number(heapMb.toFixed(1)) : null,
+      rendererName: this.rendererLabel,
+      isSoftwareGl: this.isSoftwareGl,
+      cameraYawDeg: Math.round(deg),
+      chargeRatio: Number(this.chargeState.chargeRatio.toFixed(2)),
+      isGrounded: this.isGrounded,
+      supportNormalY: Number(this.supportNormalY.toFixed(2)),
+      slimePos: slimeTf
+        ? {
+            x: Number(slimeTf.position.x.toFixed(2)),
+            y: Number(slimeTf.position.y.toFixed(2)),
+            z: Number(slimeTf.position.z.toFixed(2)),
+          }
+        : { x: 0, y: 0.65, z: 4.0 },
+      slimeVelY: slimeTf ? Number(slimeTf.velocity.y.toFixed(2)) : 0,
+      balloonPos: balloonTf
+        ? {
+            x: Number(balloonTf.position.x.toFixed(2)),
+            y: Number(balloonTf.position.y.toFixed(2)),
+            z: Number(balloonTf.position.z.toFixed(2)),
+          }
+        : { x: 0, y: 2.55, z: 1.8 },
+      balloonVelY: balloonTf ? Number(balloonTf.velocity.y.toFixed(2)) : 0,
+      attemptState: this.attemptState,
+      popSurfaceId: this.popSurfaceId,
+      impulseVec: impulsePreview,
+      gamepadName: input?.gamepadName ?? null,
+      engineKind: this.engineKind,
+      rapierReady: this.rapierReady,
+    });
+  }
 
   private scheduleNextTick() {
     if (this.disposed) return;

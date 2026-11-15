@@ -25,6 +25,10 @@ const INITIAL_TELEMETRY: LabTelemetry = {
   supportNormalY: 1,
   slimePos: { x: 0, y: 0.65, z: 4.0 },
   slimeVelY: 0,
+  balloonPos: { x: 0, y: 2.55, z: 1.8 },
+  balloonVelY: 0,
+  attemptState: 'playing',
+  popSurfaceId: null,
   impulseVec: { x: 0, y: 0, z: 0 },
   gamepadName: null,
   engineKind: 'rapier',
@@ -127,7 +131,7 @@ export default function App() {
     setAudioUnlocked(Boolean(ok));
     if (ok) {
       audioRef.current?.playLaunch(0.8);
-      window.setTimeout(() => audioRef.current?.playBounce(0.6), 180);
+      window.setTimeout(() => audioRef.current?.playBalloonChime(), 160);
     }
   };
 
@@ -154,6 +158,8 @@ export default function App() {
     return null;
   })();
 
+  const isPopped = activeTab === 'ARENA' && telemetry.attemptState === 'popped';
+
   return (
     <div
       className="flex flex-col h-screen w-screen overflow-hidden bg-[#0B0E17] text-slate-100"
@@ -162,6 +168,9 @@ export default function App() {
       data-grounded={telemetry.isGrounded ? 'true' : 'false'}
       data-charge={telemetry.chargeRatio}
       data-slime-y={telemetry.slimePos.y}
+      data-balloon-y={telemetry.balloonPos.y}
+      data-attempt-state={telemetry.attemptState}
+      data-pop-surface={telemetry.popSurfaceId ?? ''}
       data-camera-yaw={telemetry.cameraYawDeg}
     >
       {/* Top Header */}
@@ -171,7 +180,7 @@ export default function App() {
         </span>
 
         <nav
-          aria-label="Modos da Etapa 1"
+          aria-label="Modos da Etapa 2"
           className="flex items-center gap-1 sm:gap-1.5 overflow-x-auto no-scrollbar py-1"
         >
           {tabs.map((tab) => {
@@ -245,8 +254,37 @@ export default function App() {
           </div>
         )}
 
-        {/* Touch Overlay: Left Stick + Impulse Button ONLY (Free screen drag controls camera) */}
-        {activeTab !== 'REPORT' && (
+        {/* Popped Attempt Prompt (no backdrop-filter over WebGL) */}
+        {isPopped && (
+          <div
+            role="alertdialog"
+            aria-labelledby="pop-alert-title"
+            data-testid="balloon-popped-overlay"
+            className="fixed inset-0 z-40 flex items-center justify-center px-4 pointer-events-none"
+          >
+            <div className="pointer-events-auto w-full max-w-sm rounded-xl border border-rose-500/50 bg-[#0f172a]/95 p-5 text-center shadow-2xl space-y-3">
+              <h2 id="pop-alert-title" className="font-display text-lg font-semibold text-rose-300">
+                {t(locale, 'popTitle')}
+              </h2>
+              <p className="text-xs text-slate-300">
+                {t(locale, 'popSubtitle')}{' '}
+                <strong className="font-mono text-white">{telemetry.popSurfaceId}</strong>
+              </p>
+              <button
+                type="button"
+                data-testid="retry-attempt-button"
+                onClick={() => void sceneMgrRef.current?.resetScenario()}
+                className="inline-flex items-center justify-center gap-2 w-full px-4 py-2.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-semibold text-sm transition-colors min-h-[44px]"
+              >
+                <RotateCcw className="w-4 h-4" aria-hidden="true" />
+                <span>{t(locale, 'popRetry')}</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Touch Overlay: Left Stick + Impulse Button ONLY */}
+        {activeTab !== 'REPORT' && !isPopped && (
           <TouchControlsOverlay
             visible={touchVisible}
             leftStickLabel={t(locale, 'leftStickLabel')}
@@ -294,7 +332,7 @@ export default function App() {
 
             {dockOpen && (
               <section
-                aria-label="Controles e telemetria da Etapa 1"
+                aria-label="Controles e telemetria da Etapa 2"
                 className="pointer-events-auto w-full rounded-lg border border-slate-700/90 bg-[#0f172a]/95 px-3.5 py-2.5 space-y-2.5"
               >
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] font-mono text-slate-300 border-b border-slate-800 pb-2 tabular-nums">
@@ -308,10 +346,14 @@ export default function App() {
                   <span>
                     {t(locale, 'metricCharge')}: <strong className="text-cyan-300">{Math.round(telemetry.chargeRatio * 100)}%</strong>
                   </span>
-                  <span aria-hidden="true" className="text-slate-600">·</span>
-                  <span>
-                    Y: <strong className="text-white">{telemetry.slimePos.y} m</strong>
-                  </span>
+                  {activeTab === 'ARENA' && (
+                    <>
+                      <span aria-hidden="true" className="text-slate-600">·</span>
+                      <span>
+                        {t(locale, 'metricBalloonY')}: <strong className="text-sky-300">{telemetry.balloonPos.y} m</strong>
+                      </span>
+                    </>
+                  )}
                   <span aria-hidden="true" className="text-slate-600">·</span>
                   <span>
                     {t(locale, 'metricFps')}: <strong className="text-white">{telemetry.fps}</strong>

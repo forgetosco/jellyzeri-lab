@@ -74,7 +74,7 @@ export function TechReportView({ locale, telemetry, audioState }: TechReportView
         </section>
 
         <section className="space-y-3">
-          <h2 className="text-lg font-semibold text-white">Arquitetura e Correções Implementadas na Etapa 1</h2>
+          <h2 className="text-lg font-semibold text-white">Arquitetura Ativa — Etapas 1 e 2</h2>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div className="border border-slate-800 bg-[#111827] rounded-lg p-4 space-y-2">
               <div className="flex items-center justify-between gap-2">
@@ -82,27 +82,27 @@ export function TechReportView({ locale, telemetry, audioState }: TechReportView
                 <EvidenceLabel tag="Validado em testes unitários" />
               </div>
               <p className="text-xs text-slate-300 leading-relaxed">
-                Rapier3D foi estabelecido como motor padrão (`canSleep: false` no slime). O apoio usa `contactPairsWith` e `solverContactPoint`, exigindo normal ascendente (`ny &gt;= 0.58`) e velocidade de separação limitada (`dot(v, n) &lt;= 1.6`). Paredes verticais, tetos e subida após impulso são rejeitados sem temporizadores artificiais.
+                Rapier3D é o motor principal (`canSleep: false`, CCD ativo). O apoio do slime usa `contactPairsWith` e `solverContactPoint`, exigindo normal ascendente (`ny &gt;= 0.58`) e velocidade de separação limitada (`dot(v, n) &lt;= 1.6`).
               </p>
             </div>
 
             <div className="border border-slate-800 bg-[#111827] rounded-lg p-4 space-y-2">
               <div className="flex items-center justify-between gap-2">
-                <h3 className="font-semibold text-white">2. Personagem Jellyzerī Desacoplado</h3>
-                <EvidenceLabel tag="Testado e observado" />
+                <h3 className="font-semibold text-white">2. Bebê Balão &amp; Flutuabilidade Debilitada</h3>
+                <EvidenceLabel tag="Validado em testes unitários" />
               </div>
               <p className="text-xs text-slate-300 leading-relaxed">
-                Corpo roxo orgânico levemente irregular com núcleo luminoso, micro-bolhas internas, borda Fresnel por shader (`onBeforeCompile`), piscar natural e expressões dinâmicas (repouso, carga concentrada, voo e aterrissagem) preservando o colisor esférico estável.
+                Sustentação vertical parcial (`buoyancyRatio = 0.875 &lt; 1.0`) com oscilação senoidal suave e amortecimento aéreo controlado. O bebê tende a descer gradualmente sem pairar imóvel, reagindo à normal e intensidade de impacto de Jellyzerī sem assistência automática.
               </p>
             </div>
 
             <div className="border border-slate-800 bg-[#111827] rounded-lg p-4 space-y-2">
               <div className="flex items-center justify-between gap-2">
-                <h3 className="font-semibold text-white">3. Câmera &amp; Multitouch Isolado</h3>
+                <h3 className="font-semibold text-white">3. Colisão Fatal &amp; Anti-Tunneling</h3>
                 <EvidenceLabel tag="Testado e observado" />
               </div>
               <p className="text-xs text-slate-300 leading-relaxed">
-                O analógico direito virtual e as teclas Q/E foram removidos. Em dispositivos móveis, apenas o analógico esquerdo e o botão IMPULSO ficam sobre a tela; a área livre do canvas orbita a câmera com rastreamento estrito por `pointerId`.
+                Substeps fixos de `1/60s` verificam `EventQueue` e contatos pós-passo contra chão, plataformas, paredes, rampas e teto. Qualquer superfície encerra a tentativa imediatamente (`popped`), enquanto o contato com Jellyzerī permanece seguro.
               </p>
             </div>
 

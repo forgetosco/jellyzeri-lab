@@ -23,6 +23,11 @@ export interface SupportContactInfo {
   contactCount: number;
 }
 
+export interface BodyCollisionReport {
+  hitSurfaceId: string | null;
+  hitBodyIds: string[];
+}
+
 export interface PhysicsBodyHandle {
   id: string;
   applyImpulse(impulse: Vec3): void;
@@ -31,6 +36,7 @@ export interface PhysicsBodyHandle {
   getVelocity(): Vec3;
   getTransform(): BodyTransform;
   setPosition(pos: Vec3): void;
+  setEnabled(enabled: boolean): void;
   wakeUp(): void;
 }
 
@@ -57,6 +63,7 @@ export interface IPhysicsWorld {
       linearDamping?: number;
       angularDamping?: number;
       canSleep?: boolean;
+      ccdEnabled?: boolean;
     }
   ): PhysicsBodyHandle;
   addDynamicBox(
@@ -71,6 +78,7 @@ export interface IPhysicsWorld {
     }
   ): PhysicsBodyHandle;
   getSupportContact(handle: PhysicsBodyHandle, minNormalY?: number): SupportContactInfo;
+  getBodyCollisions(handle: PhysicsBodyHandle, nonFatalBodyIds?: string[]): BodyCollisionReport;
   step(dt: number): void;
   dispose(): void;
 }
@@ -84,6 +92,7 @@ class CannonPhysicsWorld implements IPhysicsWorld {
   private defaultMat: CANNON.Material;
   private bouncyMat: CANNON.Material;
   private bodiesById = new Map<string, CANNON.Body>();
+  private idByBody = new Map<CANNON.Body, string>();
 
   constructor() {
     this.world = new CANNON.World({
@@ -137,6 +146,7 @@ class CannonPhysicsWorld implements IPhysicsWorld {
       body.quaternion.set(rotation.x, rotation.y, rotation.z, rotation.w);
     }
     (body as unknown as { userDataId: string }).userDataId = id;
+    this.idByBody.set(body, id);
     this.world.addBody(body);
   }
 
@@ -151,6 +161,7 @@ class CannonPhysicsWorld implements IPhysicsWorld {
       linearDamping?: number;
       angularDamping?: number;
       canSleep?: boolean;
+      ccdEnabled?: boolean;
     }
   ): PhysicsBodyHandle {
     const mat = (options?.restitution ?? 0.2) > 0.4 ? this.bouncyMat : this.defaultMat;
@@ -167,6 +178,7 @@ class CannonPhysicsWorld implements IPhysicsWorld {
     body.sleepTimeLimit = 1.0;
     this.world.addBody(body);
     this.bodiesById.set(id, body);
+    this.idByBody.set(body, id);
     return this.wrapBody(id, body);
   }
 
@@ -192,6 +204,7 @@ class CannonPhysicsWorld implements IPhysicsWorld {
     });
     this.world.addBody(body);
     this.bodiesById.set(id, body);
+    this.idByBody.set(body, id);
     return this.wrapBody(id, body);
   }
 
@@ -227,6 +240,32 @@ class CannonPhysicsWorld implements IPhysicsWorld {
       normalY: contactCount > 0 ? bestNormalY : 0,
       contactCount,
     };
+  }
+
+  public getBodyCollisions(
+    handle: PhysicsBodyHandle,
+    nonFatalBodyIds: string[] = []
+  ): BodyCollisionReport {
+    const body = this.bodiesById.get(handle.id);
+    if (!body) return { hitSurfaceId: null, hitBodyIds: [] };
+
+    const nonFatalSet = new Set(nonFatalBodyIds);
+    let hitSurfaceId: string | null = null;
+    const hitBodyIds: string[] = [];
+
+    for (let i = 0; i < this.world.contacts.length; i++) {
+      const c = this.world.contacts[i];
+      if (c.bi !== body && c.bj !== body) continue;
+      const other = c.bi === body ? c.bj : c.bi;
+      const otherId = this.idByBody.get(other) ?? 'surface';
+      if (nonFatalSet.has(otherId)) {
+        if (!hitBodyIds.includes(otherId)) hitBodyIds.push(otherId);
+      } else if (hitSurfaceId === null) {
+        hitSurfaceId = otherId;
+      }
+    }
+
+    return { hitSurfaceId, hitBodyIds };
   }
 
   private wrapBody(id: string, body: CANNON.Body): PhysicsBodyHandle {
@@ -265,6 +304,17 @@ class CannonPhysicsWorld implements IPhysicsWorld {
         body.velocity.set(0, 0, 0);
         body.angularVelocity.set(0, 0, 0);
       },
+      setEnabled(enabled: boolean) {
+        body.collisionResponse = enabled;
+        if (!enabled) {
+          body.type = CANNON.Body.KINEMATIC;
+          body.velocity.set(0, 0, 0);
+          body.angularVelocity.set(0, 0, 0);
+        } else {
+          body.type = CANNON.Body.DYNAMIC;
+          body.wakeUp();
+        }
+      },
       wakeUp() {
         body.wakeUp();
       },
@@ -279,6 +329,7 @@ class CannonPhysicsWorld implements IPhysicsWorld {
 
   public dispose(): void {
     this.bodiesById.clear();
+    this.idByBody.clear();
     while (this.world.bodies.length > 0) {
       this.world.removeBody(this.world.bodies[0]);
     }
@@ -299,11 +350,15 @@ class RapierPhysicsWorld implements IPhysicsWorld {
   public lastStepMs = 0;
 
   private world: RAPIER.World;
+  private eventQueue: RAPIER.EventQueue;
   private dynamicBodies: RAPIER.RigidBody[] = [];
   private trackedColliders = new Map<string, { body: RAPIER.RigidBody; collider: RAPIER.Collider }>();
+  private colliderIdByHandle = new Map<number, string>();
+  private stepStartedPairs = new Map<number, Set<number>>();
 
   constructor() {
     this.world = new RAPIER.World({ x: 0, y: -this.gravity, z: 0 });
+    this.eventQueue = new RAPIER.EventQueue(true);
   }
 
   public bodyCount(): number {
@@ -311,7 +366,7 @@ class RapierPhysicsWorld implements IPhysicsWorld {
   }
 
   public addStaticBox(
-    _id: string,
+    id: string,
     pos: Vec3,
     halfExtents: Vec3,
     restitution = 0.25,
@@ -324,8 +379,10 @@ class RapierPhysicsWorld implements IPhysicsWorld {
     const body = this.world.createRigidBody(bodyDesc);
     const colliderDesc = RAPIER.ColliderDesc.cuboid(halfExtents.x, halfExtents.y, halfExtents.z)
       .setRestitution(restitution)
-      .setFriction(0.55);
-    this.world.createCollider(colliderDesc, body);
+      .setFriction(0.55)
+      .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+    const collider = this.world.createCollider(colliderDesc, body);
+    this.colliderIdByHandle.set(collider.handle, id);
   }
 
   public addDynamicSphere(
@@ -339,6 +396,7 @@ class RapierPhysicsWorld implements IPhysicsWorld {
       linearDamping?: number;
       angularDamping?: number;
       canSleep?: boolean;
+      ccdEnabled?: boolean;
     }
   ): PhysicsBodyHandle {
     const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
@@ -348,16 +406,21 @@ class RapierPhysicsWorld implements IPhysicsWorld {
     if (options?.canSleep !== undefined) {
       bodyDesc.setCanSleep(options.canSleep);
     }
+    if (options?.ccdEnabled) {
+      bodyDesc.setCcdEnabled(true);
+    }
     const body = this.world.createRigidBody(bodyDesc);
     const volume = (4 / 3) * Math.PI * Math.pow(radius, 3);
     const density = Math.max(0.05, mass / Math.max(0.001, volume));
     const colliderDesc = RAPIER.ColliderDesc.ball(radius)
       .setDensity(density)
       .setRestitution(options?.restitution ?? 0.12)
-      .setFriction(options?.friction ?? 0.55);
+      .setFriction(options?.friction ?? 0.55)
+      .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
     const collider = this.world.createCollider(colliderDesc, body);
     this.dynamicBodies.push(body);
     this.trackedColliders.set(id, { body, collider });
+    this.colliderIdByHandle.set(collider.handle, id);
     return this.wrapBody(id, body);
   }
 
@@ -386,6 +449,7 @@ class RapierPhysicsWorld implements IPhysicsWorld {
     const collider = this.world.createCollider(colliderDesc, body);
     this.dynamicBodies.push(body);
     this.trackedColliders.set(id, { body, collider });
+    this.colliderIdByHandle.set(collider.handle, id);
     return this.wrapBody(id, body);
   }
 
@@ -461,6 +525,53 @@ class RapierPhysicsWorld implements IPhysicsWorld {
     };
   }
 
+  public getBodyCollisions(
+    handle: PhysicsBodyHandle,
+    nonFatalBodyIds: string[] = []
+  ): BodyCollisionReport {
+    const entry = this.trackedColliders.get(handle.id);
+    if (!entry) return { hitSurfaceId: null, hitBodyIds: [] };
+
+    const { collider } = entry;
+    const nonFatalSet = new Set(nonFatalBodyIds);
+    let hitSurfaceId: string | null = null;
+    const hitBodyIds: string[] = [];
+
+    const recordOtherHandle = (otherHandle: number) => {
+      const otherId = this.colliderIdByHandle.get(otherHandle) ?? 'surface';
+      if (nonFatalSet.has(otherId)) {
+        if (!hitBodyIds.includes(otherId)) hitBodyIds.push(otherId);
+      } else if (hitSurfaceId === null) {
+        hitSurfaceId = otherId;
+      }
+    };
+
+    // 1. Check collision events captured during the latest physics step (catches fast TOI/CCD hits)
+    const startedPeers = this.stepStartedPairs.get(collider.handle);
+    if (startedPeers) {
+      startedPeers.forEach((otherHandle) => recordOtherHandle(otherHandle));
+    }
+
+    // 2. Check active contact manifolds (catches sustained or resting contacts)
+    this.world.contactPairsWith(collider, (otherCollider) => {
+      this.world.contactPair(collider, otherCollider, (manifold) => {
+        if (manifold.numSolverContacts() > 0) {
+          recordOtherHandle(otherCollider.handle);
+          return;
+        }
+        const count = manifold.numContacts();
+        for (let i = 0; i < count; i++) {
+          if (manifold.contactDist(i) <= 0.004) {
+            recordOtherHandle(otherCollider.handle);
+            return;
+          }
+        }
+      });
+    });
+
+    return { hitSurfaceId, hitBodyIds };
+  }
+
   private wrapBody(id: string, body: RAPIER.RigidBody): PhysicsBodyHandle {
     return {
       id,
@@ -493,6 +604,9 @@ class RapierPhysicsWorld implements IPhysicsWorld {
         body.setLinvel({ x: 0, y: 0, z: 0 }, true);
         body.setAngvel({ x: 0, y: 0, z: 0 }, true);
       },
+      setEnabled(enabled: boolean) {
+        body.setEnabled(enabled);
+      },
       wakeUp() {
         body.wakeUp();
       },
@@ -501,8 +615,27 @@ class RapierPhysicsWorld implements IPhysicsWorld {
 
   public step(dt: number): void {
     const t0 = performance.now();
+    this.stepStartedPairs.clear();
     this.world.timestep = Math.min(dt, 1 / 30);
-    this.world.step();
+    this.world.step(this.eventQueue);
+
+    this.eventQueue.drainCollisionEvents((handle1, handle2, started) => {
+      if (!started) return;
+      let set1 = this.stepStartedPairs.get(handle1);
+      if (!set1) {
+        set1 = new Set<number>();
+        this.stepStartedPairs.set(handle1, set1);
+      }
+      set1.add(handle2);
+
+      let set2 = this.stepStartedPairs.get(handle2);
+      if (!set2) {
+        set2 = new Set<number>();
+        this.stepStartedPairs.set(handle2, set2);
+      }
+      set2.add(handle1);
+    });
+
     for (let i = 0; i < this.dynamicBodies.length; i++) {
       this.dynamicBodies[i].resetForces(false);
     }
@@ -511,7 +644,10 @@ class RapierPhysicsWorld implements IPhysicsWorld {
 
   public dispose(): void {
     this.trackedColliders.clear();
+    this.colliderIdByHandle.clear();
+    this.stepStartedPairs.clear();
     this.dynamicBodies = [];
+    this.eventQueue.free();
     this.world.free();
   }
 }
