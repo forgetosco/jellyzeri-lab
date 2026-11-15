@@ -1,0 +1,6 @@
+{
+  "name": "Jellyzerī Tech Lab",
+  "description": "Laboratório tecnológico Etapa 0 de Jellyzerī para avaliação de renderização 3D, física, deformação gelatinosa, controles móveis e Web Audio API.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
